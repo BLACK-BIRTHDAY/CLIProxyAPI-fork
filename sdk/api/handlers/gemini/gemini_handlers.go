@@ -46,32 +46,40 @@ func (h *GeminiAPIHandler) Models() []map[string]any {
 	return modelRegistry.GetAvailableModels("gemini")
 }
 
+// normalizeGeminiModelMap clones a Gemini model map and applies standard normalization:
+// ensuring the "models/" name prefix, defaulting displayName and description to the name
+// before the "models/" prefix if empty, and defaulting supportedGenerationMethods to
+// ["generateContent"] if absent.
+func normalizeGeminiModelMap(model map[string]any) map[string]any {
+	normalizedModel := make(map[string]any, len(model))
+	for k, v := range model {
+		normalizedModel[k] = v
+	}
+	if name, ok := normalizedModel["name"].(string); ok && name != "" {
+		rawName := strings.TrimPrefix(name, "models/")
+		if !strings.HasPrefix(name, "models/") {
+			normalizedModel["name"] = "models/" + name
+		}
+		if displayName, _ := normalizedModel["displayName"].(string); displayName == "" {
+			normalizedModel["displayName"] = rawName
+		}
+		if description, _ := normalizedModel["description"].(string); description == "" {
+			normalizedModel["description"] = rawName
+		}
+	}
+	if _, ok := normalizedModel["supportedGenerationMethods"]; !ok {
+		normalizedModel["supportedGenerationMethods"] = []string{"generateContent"}
+	}
+	return normalizedModel
+}
+
 // GeminiModels handles the Gemini models listing endpoint.
 // It returns a JSON response containing available Gemini models and their specifications.
 func (h *GeminiAPIHandler) GeminiModels(c *gin.Context) {
 	rawModels := h.Models()
 	normalizedModels := make([]map[string]any, 0, len(rawModels))
-	defaultMethods := []string{"generateContent"}
 	for _, model := range rawModels {
-		normalizedModel := make(map[string]any, len(model))
-		for k, v := range model {
-			normalizedModel[k] = v
-		}
-		if name, ok := normalizedModel["name"].(string); ok && name != "" {
-			if !strings.HasPrefix(name, "models/") {
-				normalizedModel["name"] = "models/" + name
-			}
-			if displayName, _ := normalizedModel["displayName"].(string); displayName == "" {
-				normalizedModel["displayName"] = name
-			}
-			if description, _ := normalizedModel["description"].(string); description == "" {
-				normalizedModel["description"] = name
-			}
-		}
-		if _, ok := normalizedModel["supportedGenerationMethods"]; !ok {
-			normalizedModel["supportedGenerationMethods"] = defaultMethods
-		}
-		normalizedModels = append(normalizedModels, normalizedModel)
+		normalizedModels = append(normalizedModels, normalizeGeminiModelMap(model))
 	}
 	h.WriteModelListResponse(c, h.HandlerType(), gin.H{
 		"models": normalizedModels,
@@ -102,18 +110,14 @@ func (h *GeminiAPIHandler) GeminiGetHandler(c *gin.Context) {
 	for _, model := range availableModels {
 		name, _ := model["name"].(string)
 		// Match name with or without 'models/' prefix
-		if name == action || name == "models/"+action {
+		if name == action || name == "models/"+action || strings.TrimPrefix(name, "models/") == strings.TrimPrefix(action, "models/") {
 			targetModel = model
 			break
 		}
 	}
 
 	if targetModel != nil {
-		// Ensure the name has 'models/' prefix in the output if it's a Gemini model
-		if name, ok := targetModel["name"].(string); ok && name != "" && !strings.HasPrefix(name, "models/") {
-			targetModel["name"] = "models/" + name
-		}
-		c.JSON(http.StatusOK, targetModel)
+		c.JSON(http.StatusOK, normalizeGeminiModelMap(targetModel))
 		return
 	}
 

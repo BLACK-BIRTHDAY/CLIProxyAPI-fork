@@ -77,6 +77,7 @@ func TestGetAvailableModelsGeminiIncludesTokenLimits(t *testing.T) {
 			DisplayName:         "Gemini 3.8 Flash",
 			ContextLength:       1048576,
 			MaxCompletionTokens: 65536,
+			Thinking:            &ThinkingSupport{DynamicAllowed: true},
 		},
 		{
 			ID:               "gemini-2.5-pro",
@@ -108,6 +109,9 @@ func TestGetAvailableModelsGeminiIncludesTokenLimits(t *testing.T) {
 	if got := fromContext["outputTokenLimit"]; got != 65536 {
 		t.Fatalf("gemini-3.8-flash outputTokenLimit = %v, want 65536", got)
 	}
+	if got, ok := fromContext["thinking"].(bool); !ok || !got {
+		t.Fatalf("gemini-3.8-flash thinking = %v, want true", fromContext["thinking"])
+	}
 
 	fromExplicit, ok := byName["models/gemini-2.5-pro"]
 	if !ok {
@@ -119,6 +123,9 @@ func TestGetAvailableModelsGeminiIncludesTokenLimits(t *testing.T) {
 	if got := fromExplicit["outputTokenLimit"]; got != 65536 {
 		t.Fatalf("gemini-2.5-pro outputTokenLimit = %v, want 65536", got)
 	}
+	if _, exists := fromExplicit["thinking"]; exists {
+		t.Fatalf("expected gemini-2.5-pro thinking to be omitted when nil, got %v", fromExplicit["thinking"])
+	}
 
 	noLimits, ok := byName["models/gemini-no-limits"]
 	if !ok {
@@ -129,6 +136,48 @@ func TestGetAvailableModelsGeminiIncludesTokenLimits(t *testing.T) {
 	}
 	if _, exists := noLimits["outputTokenLimit"]; exists {
 		t.Fatalf("expected outputTokenLimit to be omitted when unknown, got %v", noLimits)
+	}
+	if _, exists := noLimits["thinking"]; exists {
+		t.Fatalf("expected gemini-no-limits thinking to be omitted when nil, got %v", noLimits["thinking"])
+	}
+}
+
+func TestGetAvailableModelsGeminiThinking(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("client-1", "gemini", []*ModelInfo{
+		{
+			ID:       "gemini-thinking-enabled",
+			Name:     "models/gemini-thinking-enabled",
+			Thinking: &ThinkingSupport{DynamicAllowed: true},
+		},
+		{
+			ID:       "gemini-thinking-nil",
+			Name:     "models/gemini-thinking-nil",
+			Thinking: nil,
+		},
+	})
+
+	models := r.GetAvailableModels("gemini")
+	byName := make(map[string]map[string]any, len(models))
+	for _, m := range models {
+		name, _ := m["name"].(string)
+		byName[name] = m
+	}
+
+	withThinking, ok := byName["models/gemini-thinking-enabled"]
+	if !ok {
+		t.Fatalf("expected models/gemini-thinking-enabled in available models, got %v", byName)
+	}
+	if got, ok := withThinking["thinking"].(bool); !ok || !got {
+		t.Fatalf("expected thinking = true, got %v", withThinking["thinking"])
+	}
+
+	withoutThinking, ok := byName["models/gemini-thinking-nil"]
+	if !ok {
+		t.Fatalf("expected models/gemini-thinking-nil in available models, got %v", byName)
+	}
+	if _, exists := withoutThinking["thinking"]; exists {
+		t.Fatalf("expected thinking to be omitted when nil, got %v", withoutThinking["thinking"])
 	}
 }
 

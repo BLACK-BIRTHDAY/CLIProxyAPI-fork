@@ -1970,6 +1970,9 @@ func (r *ModelRegistry) convertModelToMap(model *ModelInfo, handlerType string) 
 		if len(model.SupportedOutputModalities) > 0 {
 			result["supportedOutputModalities"] = append([]string(nil), model.SupportedOutputModalities...)
 		}
+		if model.Thinking != nil {
+			result["thinking"] = true
+		}
 		return result
 
 	default:
