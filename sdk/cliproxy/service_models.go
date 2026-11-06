@@ -10,6 +10,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/modelconfig"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
@@ -98,6 +99,7 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 			if authKind == "apikey" {
 				excluded = entry.ExcludedModels
 			}
+			models = s.enrichGeminiConfigModelsFromUpstream(ctx, cfg, a, entry, models)
 		}
 		models = applyExcludedModels(models, excluded)
 	case constant.GeminiInteractions:
@@ -109,6 +111,7 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 			if authKind == "apikey" {
 				excluded = entry.ExcludedModels
 			}
+			models = s.enrichGeminiConfigModelsFromUpstream(ctx, cfg, a, entry, models)
 		}
 		models = applyExcludedModels(models, excluded)
 	case "vertex":
@@ -677,6 +680,9 @@ func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 		modelID := strings.ToLower(strings.TrimSpace(model.ID))
 		blocked := false
 		for _, pattern := range patterns {
+			if model.UserDefined && strings.Contains(pattern, "*") {
+				continue
+			}
 			if matchWildcard(pattern, modelID) {
 				blocked = true
 				break
@@ -910,6 +916,20 @@ func normalizeCompatConfigModalities(raw []string) []string {
 	return out
 }
 
+func lookupStaticModelInfoForConfiguredModel(name, metadataChannel string) *ModelInfo {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	if staticInfo := registry.LookupStaticModelInfoByChannel(name, metadataChannel); staticInfo != nil {
+		return staticInfo
+	}
+	if parsed := strings.TrimSpace(thinking.ParseSuffix(name).ModelName); parsed != "" {
+		return registry.LookupStaticModelInfoByChannel(parsed, metadataChannel)
+	}
+	return nil
+}
+
 func buildConfigModels[T modelEntry](models []T, ownedBy, modelType, metadataChannel string) []*ModelInfo {
 	if len(models) == 0 {
 		return nil
@@ -936,8 +956,55 @@ func buildConfigModels[T modelEntry](models []T, ownedBy, modelType, metadataCha
 		if resolved := modelconfig.ResolveModelInfo(name, modelType, model.GetThinking()); resolved.Thinking != nil {
 			info.Thinking = resolved.Thinking
 		}
-		if staticInfo := registry.LookupStaticModelInfoByChannel(name, metadataChannel); staticInfo != nil && staticInfo.NativeCapabilities != nil {
-			info.NativeCapabilities = cloneModelInfoForCatalogRoute(staticInfo).NativeCapabilities
+		if staticInfo := lookupStaticModelInfoForConfiguredModel(name, metadataChannel); staticInfo != nil {
+			if strings.TrimSpace(model.GetDisplayName()) == "" && strings.TrimSpace(staticInfo.DisplayName) != "" {
+				info.DisplayName = strings.TrimSpace(staticInfo.DisplayName)
+			}
+			if info.Version == "" && staticInfo.Version != "" {
+				info.Version = staticInfo.Version
+			}
+			if info.Description == "" && staticInfo.Description != "" {
+				info.Description = staticInfo.Description
+			}
+			inputLimit := staticInfo.InputTokenLimit
+			if inputLimit <= 0 {
+				inputLimit = staticInfo.ContextLength
+			}
+			if info.MaxContextLength > 0 {
+				inputLimit = info.MaxContextLength
+			}
+			info.InputTokenLimit = inputLimit
+
+			outputLimit := staticInfo.OutputTokenLimit
+			if outputLimit <= 0 {
+				outputLimit = staticInfo.MaxCompletionTokens
+			}
+			info.OutputTokenLimit = outputLimit
+
+			if info.ContextLength <= 0 {
+				info.ContextLength = info.InputTokenLimit
+			}
+			if info.MaxCompletionTokens <= 0 {
+				info.MaxCompletionTokens = info.OutputTokenLimit
+			}
+			if len(info.SupportedGenerationMethods) == 0 && len(staticInfo.SupportedGenerationMethods) > 0 {
+				info.SupportedGenerationMethods = append([]string(nil), staticInfo.SupportedGenerationMethods...)
+			}
+			if len(info.SupportedInputModalities) == 0 && len(staticInfo.SupportedInputModalities) > 0 {
+				info.SupportedInputModalities = append([]string(nil), staticInfo.SupportedInputModalities...)
+			}
+			if len(info.SupportedOutputModalities) == 0 && len(staticInfo.SupportedOutputModalities) > 0 {
+				info.SupportedOutputModalities = append([]string(nil), staticInfo.SupportedOutputModalities...)
+			}
+			if len(info.SupportedParameters) == 0 && len(staticInfo.SupportedParameters) > 0 {
+				info.SupportedParameters = append([]string(nil), staticInfo.SupportedParameters...)
+			}
+			if staticInfo.NativeCapabilities != nil {
+				info.NativeCapabilities = cloneModelInfoForCatalogRoute(staticInfo).NativeCapabilities
+			}
+			if info.Thinking == nil && staticInfo.Thinking != nil {
+				info.Thinking = modelconfig.NormalizeThinkingSupport(staticInfo.Thinking)
+			}
 		}
 		out = append(out, info)
 	}
