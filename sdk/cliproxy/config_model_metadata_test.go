@@ -259,3 +259,25 @@ func TestGeminiUpstreamModelsCachingAndClock(t *testing.T) {
 		t.Fatalf("expected expired cache call to hit server, got %d", hitCount)
 	}
 }
+
+func TestBuildGeminiConfigModelsPromotesWhitespaceAliasToDisplayName(t *testing.T) {
+	models := buildGeminiConfigModels(&config.GeminiKey{
+		Models: []config.GeminiModel{
+			{Name: "gemini-4-argon", Alias: "Gemini 4 Argon"},
+			{Name: "gemini-nano-banana-2.1", Alias: "Nano Banana 2.1"},
+			{Name: "gemini-3.8-flash", Alias: "g38f"},
+		},
+	})
+	if len(models) != 3 {
+		t.Fatalf("len(models) = %d, want 3", len(models))
+	}
+	if models[0].ID != "gemini-4-argon" || models[0].DisplayName != "Gemini 4 Argon" {
+		t.Fatalf("models[0] = (%q, %q), want (gemini-4-argon, Gemini 4 Argon)", models[0].ID, models[0].DisplayName)
+	}
+	if models[1].ID != "gemini-nano-banana-2.1" || models[1].DisplayName != "Nano Banana 2.1" {
+		t.Fatalf("models[1] = (%q, %q), want (gemini-nano-banana-2.1, Nano Banana 2.1)", models[1].ID, models[1].DisplayName)
+	}
+	if models[2].ID != "g38f" {
+		t.Fatalf("models[2].ID = %q, want g38f", models[2].ID)
+	}
+}

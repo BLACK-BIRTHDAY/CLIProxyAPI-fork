@@ -2,6 +2,7 @@ package cliproxy
 
 import (
 	"context"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -1148,7 +1149,20 @@ func buildGeminiConfigModels(entry *config.GeminiKey) []*ModelInfo {
 	if entry == nil {
 		return nil
 	}
-	return buildConfigModels(entry.Models, "google", "gemini", "gemini")
+	normalized := slices.Clone(entry.Models)
+	for i := range normalized {
+		model := &normalized[i]
+		name := strings.TrimSpace(model.Name)
+		alias := strings.TrimSpace(model.Alias)
+		// Control panels that pull /v1beta/models populate Alias with the human-readable
+		// displayName (containing spaces) while leaving DisplayName empty. Promote such
+		// whitespace aliases to DisplayName so downstream clients receive canonical IDs.
+		if strings.TrimSpace(model.DisplayName) == "" && name != "" && !strings.ContainsAny(name, " \t") && strings.ContainsAny(alias, " \t") {
+			model.DisplayName = alias
+			model.Alias = name
+		}
+	}
+	return buildConfigModels(normalized, "google", "gemini", "gemini")
 }
 
 func buildClaudeConfigModels(entry *config.ClaudeKey) []*ModelInfo {
