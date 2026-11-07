@@ -1290,6 +1290,19 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if hasUpstreamExecutionAttempt(errStream) {
 				upstreamErr = errStream
 			}
+			action, okAction := matchRequestScopedErrorAction(auth, errStream, m.runtimeConfigSnapshot())
+			if isRequestScopedStop(action, okAction) || (!okAction && (isRequestInvalidError(errStream) || cliproxyexecutor.IsUpstreamWebsocketTurnError(errStream))) {
+				// Only redispatch needs a release acknowledgement. Preserve the final
+				// response even when Home cannot acknowledge the released admission.
+				if selection != nil {
+					releaseAttempt()
+					selection.End("request_stopped")
+				}
+				if isRequestScopedStop(action, okAction) {
+					return nil, wrapRequestStopError(errStream)
+				}
+				return nil, errStream
+			}
 			if selection != nil {
 				excludeAuth := shouldExcludeHomeAuthAfterStreamError(execCtx, auth, errStream)
 				if homeSameAuthRetries[auth.ID] > 0 {
@@ -1310,11 +1323,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if errCtx := execCtx.Err(); errCtx != nil && ctx != nil && ctx.Err() != nil {
 				return nil, errCtx
 			}
-			action, okAction := matchRequestScopedErrorAction(auth, errStream, m.runtimeConfigSnapshot())
 			if okAction {
-				if isRequestScopedStop(action, okAction) {
-					return nil, wrapRequestStopError(errStream)
-				}
 				lastErr = errStream
 				if homeMode {
 					roundTiming.Observe(lastErr)
@@ -1326,9 +1335,6 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 					return nil, errJitter
 				}
 				continue
-			}
-			if isRequestInvalidError(errStream) || cliproxyexecutor.IsUpstreamWebsocketTurnError(errStream) {
-				return nil, errStream
 			}
 			lastErr = errStream
 			if homeMode {
@@ -2345,7 +2351,9 @@ func (m *Manager) VerifyInference(ctx context.Context, id, model string) (*Auth,
 	}
 
 	sessionID := fmt.Sprintf("verify-%s-%d", auth.ID, time.Now().UTC().UnixNano())
-	payload := []byte(fmt.Sprintf(`{"model":%q,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}],"max_output_tokens":1,"store":false}`, verifyModel))
+	// Codex upstreams reject integer max_output_tokens below 16, so the minimal
+	// verification budget must sit at that floor.
+	payload := []byte(fmt.Sprintf(`{"model":%q,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}],"max_output_tokens":16,"store":false}`, verifyModel))
 	req := cliproxyexecutor.Request{
 		Model:   verifyModel,
 		Payload: payload,
