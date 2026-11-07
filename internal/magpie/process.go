@@ -22,8 +22,6 @@ import (
 const (
 	// MagpieStudioVersion is the pinned upstream AIStudio2API release version.
 	MagpieStudioVersion = "0.2.19-magpie.1"
-	// CamoufoxPinnedVersion is the pinned upstream Camoufox browser version.
-	CamoufoxPinnedVersion = "152.0.4-beta.29"
 	// PreinstalledMagpieBin is the container-bundled binary path for Cloud Run.
 	PreinstalledMagpieBin = "/app/magpie/aistudio2api"
 )
@@ -104,45 +102,6 @@ type MagpieInstallStatus struct {
 	ManifestValid bool   `json:"manifest_valid"`
 }
 
-func isCamoufoxReady(dataDir string) bool {
-	if p := os.Getenv("CAMOUFOX_PATH"); strings.TrimSpace(p) != "" {
-		return true
-	}
-	exeName := "camoufox"
-	if runtime.GOOS == "windows" {
-		exeName = "camoufox.exe"
-	} else if runtime.GOOS == "linux" {
-		exeName = "camoufox-bin"
-	}
-	candidateDirs := []string{
-		filepath.Join(dataDir, "runtime", "camoufox"),
-		filepath.Join(dataDir, "package", "runtime", "camoufox"),
-	}
-	if runtime.GOOS == "windows" {
-		if localApp := os.Getenv("LOCALAPPDATA"); localApp != "" {
-			candidateDirs = append(candidateDirs, filepath.Join(localApp, "camoufox", "camoufox", "Cache"))
-		}
-	}
-	for _, dir := range candidateDirs {
-		exePath := filepath.Join(dir, exeName)
-		if fi, err := os.Stat(exePath); err == nil && !fi.IsDir() {
-			iniPath := filepath.Join(dir, "application.ini")
-			if content, err := os.ReadFile(iniPath); err == nil {
-				for _, line := range strings.Split(string(content), "\n") {
-					line = strings.TrimSpace(line)
-					if strings.HasPrefix(line, "Version=") {
-						ver := strings.TrimSpace(strings.TrimPrefix(line, "Version="))
-						if ver == CamoufoxPinnedVersion {
-							return true
-						}
-					}
-				}
-			}
-		}
-	}
-	return false
-}
-
 // GetInstallStatus returns the installation status for AIStudio2API and Camoufox.
 func GetInstallStatus(dataDir string) MagpieInstallStatus {
 	EnsurePreinstalledBinarySeeded(dataDir)
@@ -157,9 +116,9 @@ func GetInstallStatus(dataDir string) MagpieInstallStatus {
 		version = MagpieStudioVersion
 		manifestValid = true
 	} else if installed {
-		if content, err := os.ReadFile(manifestPath); err == nil {
+		if content, errRead := os.ReadFile(manifestPath); errRead == nil {
 			var m map[string]any
-			if err := json.Unmarshal(content, &m); err == nil {
+			if errUnmarshal := json.Unmarshal(content, &m); errUnmarshal == nil {
 				if v, ok := m["version"].(string); ok {
 					version = v
 					manifestValid = (v == MagpieStudioVersion)
@@ -168,12 +127,11 @@ func GetInstallStatus(dataDir string) MagpieInstallStatus {
 		}
 	}
 
-	camoufoxReady := isCamoufoxReady(dataDir)
 	return MagpieInstallStatus{
 		Installed:     installed,
 		Version:       version,
 		BinaryPath:    resolvedBin,
-		CamoufoxReady: camoufoxReady,
+		CamoufoxReady: false,
 		DataDir:       dataDir,
 		ManifestValid: manifestValid,
 	}
@@ -182,13 +140,13 @@ func GetInstallStatus(dataDir string) MagpieInstallStatus {
 // StudioAdminRequest performs an authenticated admin request to the local AIStudio2API daemon.
 func StudioAdminRequest(ctx context.Context, dataDir string, method, path string, body any, timeout time.Duration) ([]byte, error) {
 	configPath := filepath.Join(dataDir, "config.json")
-	content, err := os.ReadFile(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("MAGPIE configuration config.json not found: %w", err)
+	content, errRead := os.ReadFile(configPath)
+	if errRead != nil {
+		return nil, fmt.Errorf("MAGPIE configuration config.json not found: %w", errRead)
 	}
 	var studioCfg StudioConfigFile
-	if err := json.Unmarshal(content, &studioCfg); err != nil {
-		return nil, fmt.Errorf("failed to parse config.json: %w", err)
+	if errUnmarshal := json.Unmarshal(content, &studioCfg); errUnmarshal != nil {
+		return nil, fmt.Errorf("failed to parse config.json: %w", errUnmarshal)
 	}
 
 	baseOrigin := fmt.Sprintf("http://127.0.0.1:%d", studioCfg.Port)
@@ -202,17 +160,21 @@ func StudioAdminRequest(ctx context.Context, dataDir string, method, path string
 		"username": studioCfg.AdminUsername,
 		"password": studioCfg.AdminPassword,
 	})
-	loginReq, err := http.NewRequestWithContext(ctx, "POST", loginURL, bytes.NewReader(loginPayload))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create login request: %w", err)
+	loginReq, errLoginReq := http.NewRequestWithContext(ctx, "POST", loginURL, bytes.NewReader(loginPayload))
+	if errLoginReq != nil {
+		return nil, fmt.Errorf("failed to create login request: %w", errLoginReq)
 	}
 	loginReq.Header.Set("Content-Type", "application/json")
 
-	loginRes, err := client.Do(loginReq)
-	if err != nil {
-		return nil, fmt.Errorf("admin login connection failed: %w", err)
+	loginRes, errLoginDo := client.Do(loginReq)
+	if errLoginDo != nil {
+		return nil, fmt.Errorf("admin login connection failed: %w", errLoginDo)
 	}
-	defer loginRes.Body.Close()
+	defer func() {
+		if errClose := loginRes.Body.Close(); errClose != nil {
+			log.Debugf("failed to close admin login response body: %v", errClose)
+		}
+	}()
 
 	if loginRes.StatusCode < 200 || loginRes.StatusCode >= 300 {
 		return nil, fmt.Errorf("admin login failed: HTTP %d", loginRes.StatusCode)
@@ -245,17 +207,17 @@ func StudioAdminRequest(ctx context.Context, dataDir string, method, path string
 		case string:
 			bodyReader = strings.NewReader(b)
 		default:
-			jsonData, err := json.Marshal(b)
-			if err != nil {
-				return nil, fmt.Errorf("failed to serialize body: %w", err)
+			jsonData, errMarshal := json.Marshal(b)
+			if errMarshal != nil {
+				return nil, fmt.Errorf("failed to serialize body: %w", errMarshal)
 			}
 			bodyReader = bytes.NewReader(jsonData)
 		}
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, targetURL, bodyReader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create admin request: %w", err)
+	req, errReq := http.NewRequestWithContext(ctx, method, targetURL, bodyReader)
+	if errReq != nil {
+		return nil, fmt.Errorf("failed to create admin request: %w", errReq)
 	}
 	if adminCookie != "" {
 		req.Header.Set("Cookie", adminCookie)
@@ -264,19 +226,23 @@ func StudioAdminRequest(ctx context.Context, dataDir string, method, path string
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	res, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("admin request failed: %w", err)
+	res, errDo := client.Do(req)
+	if errDo != nil {
+		return nil, fmt.Errorf("admin request failed: %w", errDo)
 	}
-	defer res.Body.Close()
+	defer func() {
+		if errClose := res.Body.Close(); errClose != nil {
+			log.Debugf("failed to close admin response body: %v", errClose)
+		}
+	}()
 
 	if res.StatusCode == http.StatusNoContent {
 		return []byte(`{"success":true}`), nil
 	}
 
-	resBytes, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+	resBytes, errReadBody := io.ReadAll(res.Body)
+	if errReadBody != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", errReadBody)
 	}
 
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
@@ -305,13 +271,13 @@ type MagpieProcessStatus struct {
 
 // CheckServiceStatus queries /api/status and parses daemon readiness and account states.
 func CheckServiceStatus(ctx context.Context, dataDir string) (*MagpieProcessStatus, error) {
-	resBytes, err := StudioAdminRequest(ctx, dataDir, "GET", "/api/status", nil, 2500*time.Millisecond)
-	if err != nil {
-		return nil, err
+	resBytes, errAdmin := StudioAdminRequest(ctx, dataDir, "GET", "/api/status", nil, 2500*time.Millisecond)
+	if errAdmin != nil {
+		return nil, errAdmin
 	}
 	var raw map[string]any
-	if err := json.Unmarshal(resBytes, &raw); err != nil {
-		return nil, fmt.Errorf("invalid json in status: %w", err)
+	if errUnmarshal := json.Unmarshal(resBytes, &raw); errUnmarshal != nil {
+		return nil, fmt.Errorf("invalid json in status: %w", errUnmarshal)
 	}
 
 	running, _ := raw["running"].(bool)
@@ -342,9 +308,9 @@ func CheckServiceStatus(ctx context.Context, dataDir string) (*MagpieProcessStat
 
 	port := 2048
 	configPath := filepath.Join(dataDir, "config.json")
-	if c, err := os.ReadFile(configPath); err == nil {
+	if c, errReadConfig := os.ReadFile(configPath); errReadConfig == nil {
 		var studioCfg StudioConfigFile
-		if err := json.Unmarshal(c, &studioCfg); err == nil && studioCfg.Port > 0 {
+		if errUnmarshal := json.Unmarshal(c, &studioCfg); errUnmarshal == nil && studioCfg.Port > 0 {
 			port = studioCfg.Port
 		}
 	}
@@ -372,14 +338,14 @@ func StartBackend(ctx context.Context, dataDir string, cfg *MagpieConfig, inheri
 	defer startBackendMu.Unlock()
 
 	// Check if already running or responsive
-	if st, err := CheckServiceStatus(ctx, dataDir); err == nil {
+	if st, errStatus := CheckServiceStatus(ctx, dataDir); errStatus == nil {
 		if st.Running {
 			return st, nil
 		}
 		if st.State == "STOPPED" {
 			_, _ = StudioAdminRequest(ctx, dataDir, "POST", "/api/control/start", nil, 60*time.Second)
 			time.Sleep(500 * time.Millisecond)
-			if resSt, err := CheckServiceStatus(ctx, dataDir); err == nil {
+			if resSt, errRetry := CheckServiceStatus(ctx, dataDir); errRetry == nil {
 				return resSt, nil
 			}
 		}
@@ -391,9 +357,9 @@ func StartBackend(ctx context.Context, dataDir string, cfg *MagpieConfig, inheri
 		return nil, fmt.Errorf("AIStudio2API binary not installed. Please install it first")
 	}
 
-	studioCfg, err := EnsureStudioConfig(dataDir, cfg, inheritedProxy)
-	if err != nil {
-		return nil, err
+	studioCfg, errEnsure := EnsureStudioConfig(dataDir, cfg, inheritedProxy)
+	if errEnsure != nil {
+		return nil, errEnsure
 	}
 
 	// In container environments, remove any stale copy of the binary on the noexec FUSE mount
@@ -404,12 +370,12 @@ func StartBackend(ctx context.Context, dataDir string, cfg *MagpieConfig, inheri
 
 	tmpDir := ResolveRuntimeTempDir()
 	logPath := filepath.Join(tmpDir, "backend.log")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
+	logFile, errOpen := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if errOpen != nil {
 		logPath = filepath.Join(os.TempDir(), "magpie-backend.log")
-		logFile, err = os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open backend.log: %w", err)
+		logFile, errOpen = os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if errOpen != nil {
+			return nil, fmt.Errorf("failed to open backend.log: %w", errOpen)
 		}
 	}
 
@@ -432,9 +398,9 @@ func StartBackend(ctx context.Context, dataDir string, cfg *MagpieConfig, inheri
 	}
 	cmd.Env = env
 
-	if err := cmd.Start(); err != nil {
+	if errStart := cmd.Start(); errStart != nil {
 		_ = logFile.Close()
-		return nil, fmt.Errorf("failed to spawn AIStudio2API (bin=%s, cwd=%s): %w", binPath, dataDir, err)
+		return nil, fmt.Errorf("failed to spawn AIStudio2API (bin=%s, cwd=%s): %w", binPath, dataDir, errStart)
 	}
 
 	pidPath := filepath.Join(tmpDir, "backend.pid")
@@ -444,7 +410,7 @@ func StartBackend(ctx context.Context, dataDir string, cfg *MagpieConfig, inheri
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		time.Sleep(400 * time.Millisecond)
-		if st, err := CheckServiceStatus(ctx, dataDir); err == nil {
+		if st, errPoll := CheckServiceStatus(ctx, dataDir); errPoll == nil {
 			if st.State == "STOPPED" && !st.Running {
 				_, _ = StudioAdminRequest(ctx, dataDir, "POST", "/api/control/start", nil, 60*time.Second)
 			}
@@ -469,12 +435,12 @@ func StopBackend(ctx context.Context, dataDir string) error {
 		filepath.Join(dataDir, "backend.pid"),
 	}
 	for _, pidPath := range pidPaths {
-		if content, err := os.ReadFile(pidPath); err == nil {
-			if pid, err := strconv.Atoi(strings.TrimSpace(string(content))); err == nil && pid > 0 {
+		if content, errRead := os.ReadFile(pidPath); errRead == nil {
+			if pid, errParse := strconv.Atoi(strings.TrimSpace(string(content))); errParse == nil && pid > 0 {
 				if runtime.GOOS == "windows" {
 					_ = exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid)).Run()
 				} else {
-					if p, err := os.FindProcess(pid); err == nil {
+					if p, errFind := os.FindProcess(pid); errFind == nil {
 						_ = p.Kill()
 					}
 				}
@@ -494,11 +460,11 @@ func RestartBackend(ctx context.Context, dataDir string, cfg *MagpieConfig, inhe
 
 // EnsureRunning starts the backend if it is not currently running.
 func EnsureRunning(ctx context.Context, dataDir string, cfg *MagpieConfig, inheritedProxy string) error {
-	if st, err := CheckServiceStatus(ctx, dataDir); err == nil && st.Running {
+	if st, errStatus := CheckServiceStatus(ctx, dataDir); errStatus == nil && st.Running {
 		return nil
 	}
-	_, err := StartBackend(ctx, dataDir, cfg, inheritedProxy)
-	return err
+	_, errStart := StartBackend(ctx, dataDir, cfg, inheritedProxy)
+	return errStart
 }
 
 // ApplyMagpieConfig pushes the configuration in cfg to <data_dir>/config.json,
@@ -506,34 +472,34 @@ func EnsureRunning(ctx context.Context, dataDir string, cfg *MagpieConfig, inher
 func ApplyMagpieConfig(ctx context.Context, dataDir string, cfg *MagpieConfig, inheritedProxy string) error {
 	configPath := filepath.Join(dataDir, "config.json")
 	var oldPort int
-	if content, err := os.ReadFile(configPath); err == nil {
+	if content, errRead := os.ReadFile(configPath); errRead == nil {
 		var oldCfg StudioConfigFile
-		if err := json.Unmarshal(content, &oldCfg); err == nil {
+		if errUnmarshal := json.Unmarshal(content, &oldCfg); errUnmarshal == nil {
 			oldPort = oldCfg.Port
 		}
 	}
 	portChanged := oldPort > 0 && cfg.InternalPort > 0 && oldPort != cfg.InternalPort
 
 	statusBefore, _ := CheckServiceStatus(ctx, dataDir)
-	studioCfg, err := EnsureStudioConfig(dataDir, cfg, inheritedProxy)
-	if err != nil {
-		return err
+	studioCfg, errEnsure := EnsureStudioConfig(dataDir, cfg, inheritedProxy)
+	if errEnsure != nil {
+		return errEnsure
 	}
 
 	if statusBefore != nil {
 		if portChanged {
 			if statusBefore.Running {
-				_, err = RestartBackend(ctx, dataDir, cfg, inheritedProxy)
-				return err
+				_, errRestart := RestartBackend(ctx, dataDir, cfg, inheritedProxy)
+				return errRestart
 			}
 			_ = StopBackend(ctx, dataDir)
 			return nil
 		}
 
 		// Whenever the admin endpoint is reachable, push updated configuration
-		if curCfgBytes, err := StudioAdminRequest(ctx, dataDir, "GET", "/api/config", nil, 5*time.Second); err == nil {
+		if curCfgBytes, errCurCfg := StudioAdminRequest(ctx, dataDir, "GET", "/api/config", nil, 5*time.Second); errCurCfg == nil {
 			var merged map[string]any
-			if err := json.Unmarshal(curCfgBytes, &merged); err == nil {
+			if errUnmarshal := json.Unmarshal(curCfgBytes, &merged); errUnmarshal == nil {
 				warmLimit, maxActive, warmStartup := cfg.NormalizeWorkerLimits()
 				routingStrategy := "fill-first"
 				if cfg.RoutingStrategy != "" {
@@ -554,10 +520,10 @@ func ApplyMagpieConfig(ctx context.Context, dataDir string, cfg *MagpieConfig, i
 				merged["first_event_hedge_models"] = cfg.FirstEventHedgeModels
 				merged["proxy"] = resolvedProxy
 
-				if savedBytes, err := StudioAdminRequest(ctx, dataDir, "PUT", "/api/config", merged, 10*time.Second); err == nil {
+				if savedBytes, errPutCfg := StudioAdminRequest(ctx, dataDir, "PUT", "/api/config", merged, 10*time.Second); errPutCfg == nil {
 					_ = SyncStudioEnv(dataDir, studioCfg, cfg, inheritedProxy)
 					var savedRes map[string]any
-					if err := json.Unmarshal(savedBytes, &savedRes); err == nil {
+					if errUnmarshalRes := json.Unmarshal(savedBytes, &savedRes); errUnmarshalRes == nil {
 						if req, ok := savedRes["management_restart_required"].(bool); ok && req {
 							_, _ = RestartBackend(ctx, dataDir, cfg, inheritedProxy)
 						} else if req, ok := savedRes["service_restart_required"].(bool); ok && req && statusBefore.Running {
@@ -577,14 +543,14 @@ func ApplyMagpieConfig(ctx context.Context, dataDir string, cfg *MagpieConfig, i
 // containing a non-empty storage-state.json file.
 func HasImportedAccounts(dataDir string) bool {
 	authDir := filepath.Join(dataDir, "auth")
-	entries, err := os.ReadDir(authDir)
-	if err != nil {
+	entries, errReadDir := os.ReadDir(authDir)
+	if errReadDir != nil {
 		return false
 	}
 	for _, entry := range entries {
 		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
 			statePath := filepath.Join(authDir, entry.Name(), "storage-state.json")
-			if fi, err := os.Stat(statePath); err == nil && fi.Size() > 0 {
+			if fi, errStat := os.Stat(statePath); errStat == nil && fi.Size() > 0 {
 				return true
 			}
 		}
@@ -596,14 +562,14 @@ func HasImportedAccounts(dataDir string) bool {
 // auto_start is true, and at least one imported account exists.
 func AutoStartBackground(ctx context.Context, inheritedProxy string) {
 	dataDir := ResolveDataDir("")
-	cfg, err := LoadGatewayConfig(dataDir, inheritedProxy)
-	if err == nil && cfg.Enabled && cfg.AutoStart && HasImportedAccounts(dataDir) {
+	cfg, errLoad := LoadGatewayConfig(dataDir, inheritedProxy)
+	if errLoad == nil && cfg.Enabled && cfg.AutoStart && HasImportedAccounts(dataDir) {
 		go func() {
 			startCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 			defer cancel()
 			log.Infof("[MAGPIE] Auto-starting managed backend in background (dataDir=%s)", dataDir)
-			if _, err := StartBackend(startCtx, dataDir, cfg, inheritedProxy); err != nil {
-				log.Warnf("[MAGPIE] Background auto-start failed: %v", err)
+			if _, errStart := StartBackend(startCtx, dataDir, cfg, inheritedProxy); errStart != nil {
+				log.Warnf("[MAGPIE] Background auto-start failed: %v", errStart)
 			}
 		}()
 	}

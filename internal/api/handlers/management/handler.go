@@ -22,6 +22,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/magpie"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginstore"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
@@ -144,21 +145,30 @@ func isSameOrigin(c *gin.Context) bool {
 	return true
 }
 
-// NewHandler creates a new management handler instance.
-func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Manager) *Handler {
-	envSecret, _ := os.LookupEnv("MANAGEMENT_PASSWORD")
-	envSecret = strings.TrimSpace(envSecret)
-	if envSecret == "" {
-		if wp, ok := os.LookupEnv("WEB_PASSWORD"); ok && strings.TrimSpace(wp) != "" {
-			envSecret = strings.TrimSpace(wp)
-		} else if os.Getenv("K_SERVICE") != "" {
-			if ak, ok := os.LookupEnv("API_KEY"); ok && strings.TrimSpace(ak) != "" {
-				envSecret = strings.TrimSpace(ak)
-			} else if cak, ok := os.LookupEnv("CPA_API_KEY"); ok && strings.TrimSpace(cak) != "" {
-				envSecret = strings.TrimSpace(cak)
-			}
+// ResolveEnvManagementSecret resolves the management password from the environment hierarchy:
+// MANAGEMENT_PASSWORD -> WEB_PASSWORD -> (if K_SERVICE != "") API_KEY -> CPA_API_KEY.
+// Returns the resolved non-empty secret and true if found, or ("", false) if not.
+func ResolveEnvManagementSecret() (string, bool) {
+	if secret, ok := os.LookupEnv("MANAGEMENT_PASSWORD"); ok && strings.TrimSpace(secret) != "" {
+		return strings.TrimSpace(secret), true
+	}
+	if wp, ok := os.LookupEnv("WEB_PASSWORD"); ok && strings.TrimSpace(wp) != "" {
+		return strings.TrimSpace(wp), true
+	}
+	if os.Getenv("K_SERVICE") != "" {
+		if ak, ok := os.LookupEnv("API_KEY"); ok && strings.TrimSpace(ak) != "" {
+			return strings.TrimSpace(ak), true
+		}
+		if cak, ok := os.LookupEnv("CPA_API_KEY"); ok && strings.TrimSpace(cak) != "" {
+			return strings.TrimSpace(cak), true
 		}
 	}
+	return "", false
+}
+
+// NewHandler creates a new management handler instance.
+func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Manager) *Handler {
+	envSecret, _ := ResolveEnvManagementSecret()
 
 	h := &Handler{
 		cfg:                 cfg.CloneForRuntime(),
@@ -410,7 +420,11 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		c.Header("X-CPA-VERSION", buildinfo.Version)
 		c.Header("X-CPA-COMMIT", buildinfo.Commit)
 		c.Header("X-CPA-BUILD-DATE", buildinfo.BuildDate)
-		c.Header("X-CPA-SUPPORT-PLUGIN", pluginhost.SupportPluginHeaderValue())
+		supportPluginVal := pluginhost.SupportPluginHeaderValue()
+		if magpie.ShouldExposeBuiltinMenu() {
+			supportPluginVal = "1"
+		}
+		c.Header("X-CPA-SUPPORT-PLUGIN", supportPluginVal)
 
 		clientIP := c.ClientIP()
 		localClient := clientIP == "127.0.0.1" || clientIP == "::1"

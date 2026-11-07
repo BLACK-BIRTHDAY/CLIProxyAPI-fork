@@ -131,16 +131,7 @@ func (h *GeminiAPIHandler) GeminiGetHandler(c *gin.Context) {
 				return
 			}
 		}
-		fallback := magpie.MagpieModelInfo{
-			ID:                         rawModel,
-			PrefixedID:                 magpie.PrefixMagpieModel(rawModel),
-			DisplayName:                magpie.PrefixMagpieModel(rawModel),
-			Description:                fmt.Sprintf("Google AI Studio model: %s", rawModel),
-			InputTokenLimit:            1048576,
-			OutputTokenLimit:           65536,
-			SupportedGenerationMethods: []string{"generateContent", "streamGenerateContent", "countTokens"},
-		}
-		c.JSON(http.StatusOK, magpie.ToGeminiModelMap(fallback))
+		c.JSON(http.StatusOK, magpie.SynthesizeGeminiModelMap(rawModel))
 		return
 	}
 

@@ -151,23 +151,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		wd = configFilePath
 	}
 
-	envAdminPassword, envAdminPasswordSet := os.LookupEnv("MANAGEMENT_PASSWORD")
-	envAdminPassword = strings.TrimSpace(envAdminPassword)
-	if !envAdminPasswordSet || envAdminPassword == "" {
-		if wp, ok := os.LookupEnv("WEB_PASSWORD"); ok && strings.TrimSpace(wp) != "" {
-			envAdminPassword = strings.TrimSpace(wp)
-			envAdminPasswordSet = true
-		} else if os.Getenv("K_SERVICE") != "" {
-			if ak, ok := os.LookupEnv("API_KEY"); ok && strings.TrimSpace(ak) != "" {
-				envAdminPassword = strings.TrimSpace(ak)
-				envAdminPasswordSet = true
-			} else if cak, ok := os.LookupEnv("CPA_API_KEY"); ok && strings.TrimSpace(cak) != "" {
-				envAdminPassword = strings.TrimSpace(cak)
-				envAdminPasswordSet = true
-			}
-		}
-	}
-	envManagementSecret := envAdminPasswordSet && envAdminPassword != ""
+	_, envManagementSecret := managementHandlers.ResolveEnvManagementSecret()
 
 	// Create server instance
 	s := &Server{

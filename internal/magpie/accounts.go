@@ -428,6 +428,7 @@ func ImportAccountsBundle(ctx context.Context, dataDir string, bundle *MagpieAcc
 	}
 
 	// 3. Hot-reload backend if currently running, or start if auto_start is enabled
+	InvalidateModelsCache()
 	if st, err := CheckServiceStatus(ctx, dataDir); err == nil && st.Running {
 		if _, err := RestartBackend(ctx, dataDir, cfg, inheritedProxy); err != nil {
 			log.Warnf("[MAGPIE] Failed to restart backend after account import: %v", err)

@@ -657,6 +657,7 @@ func HydrateConfig(ctx context.Context, dataDir string, cfg *MagpieConfig, inher
 // SaveMagpieConfig persists cfg to <data_dir>/magpie-gateway.json and invokes ApplyMagpieConfig
 // to push the updated configuration to the active backend.
 func SaveMagpieConfig(ctx context.Context, dataDir string, cfg *MagpieConfig, inheritedProxy string) error {
+	InvalidateModelsCache()
 	if err := SaveGatewayConfig(dataDir, cfg); err != nil {
 		return fmt.Errorf("failed to save gateway config: %w", err)
 	}

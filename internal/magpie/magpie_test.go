@@ -10,8 +10,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
+
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 func TestStripAndPrefixMagpieModel(t *testing.T) {
@@ -572,6 +576,87 @@ func TestToolAliasingAndSchemaNormalization(t *testing.T) {
 	if oaiName != longName {
 		t.Errorf("restored OpenAI function name = %v, expected %s", oaiName, longName)
 	}
+
+	// 4. Gemini omitted and nil parameters schema normalization
+	geminiReqOmitted := map[string]any{
+		"tools": []any{
+			map[string]any{
+				"functionDeclarations": []any{
+					map[string]any{
+						"name": "omitted_params_func",
+					},
+				},
+			},
+		},
+	}
+	_ = AliasGeminiTools(geminiReqOmitted)
+	fdOmitted := geminiReqOmitted["tools"].([]any)[0].(map[string]any)["functionDeclarations"].([]any)[0].(map[string]any)
+	if p, ok := fdOmitted["parameters"].(map[string]any); !ok || p["type"] != "OBJECT" || p["properties"] == nil {
+		t.Errorf("omitted Gemini parameters not normalized to OBJECT and empty properties: %v", fdOmitted["parameters"])
+	}
+
+	geminiReqNil := map[string]any{
+		"tools": []any{
+			map[string]any{
+				"functionDeclarations": []any{
+					map[string]any{
+						"name":       "nil_params_func",
+						"parameters": nil,
+					},
+				},
+			},
+		},
+	}
+	_ = AliasGeminiTools(geminiReqNil)
+	fdNil := geminiReqNil["tools"].([]any)[0].(map[string]any)["functionDeclarations"].([]any)[0].(map[string]any)
+	if p, ok := fdNil["parameters"].(map[string]any); !ok || p["type"] != "OBJECT" || p["properties"] == nil {
+		t.Errorf("nil Gemini parameters not normalized to OBJECT and empty properties: %v", fdNil["parameters"])
+	}
+
+	// 5. OpenAI omitted and nil parameters schema normalization
+	openaiReqOmitted := map[string]any{
+		"tools": []any{
+			map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name": "omitted_params_func",
+				},
+			},
+		},
+	}
+	_ = AliasOpenAITools(openaiReqOmitted)
+	fnOmitted := openaiReqOmitted["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	if _, exists := fnOmitted["parameters"]; exists {
+		t.Errorf("omitted OpenAI parameters should remain omitted, but found: %v", fnOmitted)
+	}
+
+	openaiReqNil := map[string]any{
+		"tools": []any{
+			map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name":       "nil_params_func",
+					"parameters": nil,
+				},
+			},
+		},
+	}
+	_ = AliasOpenAITools(openaiReqNil)
+	fnNil := openaiReqNil["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	if p, ok := fnNil["parameters"].(map[string]any); !ok || p["type"] != "object" || p["properties"] == nil {
+		t.Errorf("nil OpenAI parameters not normalized to object and empty properties: %v", fnNil["parameters"])
+	}
+}
+
+type mockUsageSink struct {
+	mu      sync.Mutex
+	records []coreusage.Record
+}
+
+func (m *mockUsageSink) HandleUsage(ctx context.Context, record coreusage.Record) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.records = append(m.records, record)
 }
 
 func TestForwardGeminiRequests(t *testing.T) {
@@ -598,9 +683,10 @@ func TestForwardGeminiRequests(t *testing.T) {
 				},
 				"modelVersion": "gemini-2.5-flash",
 				"usageMetadata": map[string]any{
-					"promptTokenCount":     float64(10),
-					"candidatesTokenCount": float64(20),
-					"totalTokenCount":      float64(30),
+					"promptTokenCount":        float64(10),
+					"candidatesTokenCount":    float64(20),
+					"totalTokenCount":         float64(30),
+					"cachedContentTokenCount": float64(5),
 				},
 			})
 			return
@@ -653,6 +739,9 @@ func TestForwardGeminiRequests(t *testing.T) {
 	}))
 	defer server.Close()
 
+	usageSink := &mockUsageSink{}
+	coreusage.RegisterNamedPlugin("test-gemini-sink", usageSink)
+
 	testCfg := NewDefaultConfig()
 	testCfg.Enabled = true
 	SetTestBackendOverride(&TestBackendOverride{
@@ -679,6 +768,19 @@ func TestForwardGeminiRequests(t *testing.T) {
 	if respMap["modelVersion"] != "(MAGPIE)/gemini-2.5-flash" {
 		t.Errorf("modelVersion = %v, expected '(MAGPIE)/gemini-2.5-flash'", respMap["modelVersion"])
 	}
+
+	// Verify cached tokens were extracted into usage
+	time.Sleep(50 * time.Millisecond)
+	usageSink.mu.Lock()
+	if len(usageSink.records) > 0 {
+		last := usageSink.records[len(usageSink.records)-1]
+		if last.Detail.CachedTokens != 5 {
+			t.Errorf("expected cached tokens 5, got %d", last.Detail.CachedTokens)
+		}
+	} else {
+		t.Errorf("no usage record captured for Gemini request")
+	}
+	usageSink.mu.Unlock()
 
 	// 2. Streaming SSE test
 	reqStream := httptest.NewRequest("POST", "/v1beta/models/(MAGPIE)/gemini-2.5-flash:streamGenerateContent", strings.NewReader(`{"contents":[]}`))
@@ -764,10 +866,16 @@ func TestForwardOpenAIChatRequests(t *testing.T) {
 				"prompt_tokens":     float64(15),
 				"completion_tokens": float64(25),
 				"total_tokens":      float64(40),
+				"prompt_tokens_details": map[string]any{
+					"cached_tokens": float64(8),
+				},
 			},
 		})
 	}))
 	defer server.Close()
+
+	usageSink := &mockUsageSink{}
+	coreusage.RegisterNamedPlugin("test-openai-sink", usageSink)
 
 	testCfg := NewDefaultConfig()
 	testCfg.Enabled = true
@@ -795,6 +903,19 @@ func TestForwardOpenAIChatRequests(t *testing.T) {
 		t.Errorf("OpenAI response model = %v, expected '(MAGPIE)/gemini-3.1-pro-preview'", respMap["model"])
 	}
 
+	// Verify cached tokens were extracted into usage
+	time.Sleep(50 * time.Millisecond)
+	usageSink.mu.Lock()
+	if len(usageSink.records) > 0 {
+		last := usageSink.records[len(usageSink.records)-1]
+		if last.Detail.CachedTokens != 8 {
+			t.Errorf("expected cached tokens 8, got %d", last.Detail.CachedTokens)
+		}
+	} else {
+		t.Errorf("no usage record captured for OpenAI request")
+	}
+	usageSink.mu.Unlock()
+
 	// 2. Streaming SSE test
 	reqStreamJSON := []byte(`{"model":"(MAGPIE)/gemini-3.1-pro-preview","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
 	reqStream := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(string(reqStreamJSON)))
@@ -811,5 +932,113 @@ func TestForwardOpenAIChatRequests(t *testing.T) {
 	}
 	if !strings.Contains(streamText, "(MAGPIE)/gemini-3.1-pro-preview") {
 		t.Errorf("stream response missing rewritten model: %s", streamText)
+	}
+}
+
+func TestForwardingBypassesOutboundProxy(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "generateContent") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"modelVersion": "gemini-2.5-flash",
+				"candidates": []any{
+					map[string]any{
+						"content": map[string]any{
+							"parts": []any{
+								map[string]any{"text": "mocked gemini response"},
+							},
+						},
+					},
+				},
+			})
+			return
+		}
+		if strings.Contains(r.URL.Path, "/v1/chat/completions") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":    "chatcmpl-test",
+				"model": "gemini-3.1-pro-preview",
+				"choices": []any{
+					map[string]any{
+						"message": map[string]any{
+							"role":    "assistant",
+							"content": "mocked openai response",
+						},
+					},
+				},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	testCfg := NewDefaultConfig()
+	testCfg.Enabled = true
+	// Set an unreachable proxy address. If loopback forwarding routes through this proxy, it will fail!
+	testCfg.Proxy = "http://127.0.0.1:1"
+	SetTestBackendOverride(&TestBackendOverride{
+		BaseURL: server.URL,
+		APIKey:  "as_test_secret",
+		Config:  *testCfg,
+	})
+	defer SetTestBackendOverride(nil)
+
+	// 1. ForwardGeminiRequest must succeed even with dead proxy configured
+	reqGemini := httptest.NewRequest("POST", "/v1beta/models/(MAGPIE)/gemini-2.5-flash:generateContent", strings.NewReader(`{"contents":[]}`))
+	wGemini := httptest.NewRecorder()
+	ForwardGeminiRequest(wGemini, reqGemini, "gemini-2.5-flash", "generateContent", []byte(`{"contents":[]}`), "", "user_key_1")
+	if wGemini.Code != http.StatusOK {
+		t.Fatalf("ForwardGeminiRequest failed with status %d (loopback must bypass proxy): %s", wGemini.Code, wGemini.Body.String())
+	}
+
+	// 2. ForwardOpenAIChatRequest must succeed even with dead proxy configured
+	reqOpenAI := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"(MAGPIE)/gemini-3.1-pro-preview","messages":[{"role":"user","content":"hi"}]}`))
+	wOpenAI := httptest.NewRecorder()
+	ForwardOpenAIChatRequest(wOpenAI, reqOpenAI, "gemini-3.1-pro-preview", []byte(`{"model":"(MAGPIE)/gemini-3.1-pro-preview","messages":[{"role":"user","content":"hi"}]}`), "", "user_key_1")
+	if wOpenAI.Code != http.StatusOK {
+		t.Fatalf("ForwardOpenAIChatRequest failed with status %d (loopback must bypass proxy): %s", wOpenAI.Code, wOpenAI.Body.String())
+	}
+}
+
+func TestFetchMagpieModelsInMemoryCacheAndInvalidation(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AI_STUDIO_DATA_DIR", dataDir)
+	modelsCachePath := filepath.Join(dataDir, "models-cache.json")
+	initialModels := []MagpieModelInfo{
+		{
+			ID:          "gemini-2.5-flash",
+			PrefixedID:  "(MAGPIE)/gemini-2.5-flash",
+			DisplayName: "Gemini 2.5 Flash",
+		},
+	}
+	cacheBytes, _ := json.Marshal(initialModels)
+	_ = os.WriteFile(modelsCachePath, cacheBytes, 0644)
+
+	cfg := NewDefaultConfig()
+	cfg.Enabled = true
+	_ = SaveGatewayConfig(dataDir, cfg)
+
+	// Invalidate to start fresh
+	InvalidateModelsCache()
+
+	// 1. Fetch models when daemon config is not present should fall back to models-cache.json
+	models := FetchMagpieModels(context.Background(), "")
+	if len(models) != 1 || models[0].ID != "gemini-2.5-flash" {
+		t.Fatalf("expected fallback model from cache, got: %v", models)
+	}
+
+	// 2. Modify disk file; in-memory cache should still serve cached results within TTL
+	_ = os.WriteFile(modelsCachePath, []byte("[]"), 0644)
+	modelsCached := FetchMagpieModels(context.Background(), "")
+	if len(modelsCached) != 1 || modelsCached[0].ID != "gemini-2.5-flash" {
+		t.Fatalf("expected in-memory cached model, got: %v", modelsCached)
+	}
+
+	// 3. Invalidate cache; now it should reload from disk
+	InvalidateModelsCache()
+	modelsReloaded := FetchMagpieModels(context.Background(), "")
+	if len(modelsReloaded) != 0 {
+		t.Fatalf("expected empty models after cache invalidation, got: %v", modelsReloaded)
 	}
 }

@@ -11,13 +11,13 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/google/uuid"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
@@ -47,6 +47,7 @@ func SetTestBackendOverride(override *TestBackendOverride) {
 	testBackendOverrideMu.Lock()
 	defer testBackendOverrideMu.Unlock()
 	testBackendOverride = override
+	InvalidateModelsCache()
 }
 
 // GetTestBackendOverride returns the active test backend override, if set.
@@ -71,16 +72,16 @@ func InternalBaseURLAndKey(ctx context.Context, inheritedProxy string) (string, 
 	}
 
 	dataDir := ResolveDataDir("")
-	cfg, err := LoadGatewayConfig(dataDir, inheritedProxy)
-	if err != nil {
-		return "", "", nil, fmt.Errorf("failed to load gateway config: %w", err)
+	cfg, errLoad := LoadGatewayConfig(dataDir, inheritedProxy)
+	if errLoad != nil {
+		return "", "", nil, fmt.Errorf("failed to load gateway config: %w", errLoad)
 	}
 	if cfg.AutoStart {
 		_ = EnsureRunning(ctx, dataDir, cfg, inheritedProxy)
 	}
-	studioCfg, err := EnsureStudioConfig(dataDir, cfg, inheritedProxy)
-	if err != nil {
-		return "", "", nil, fmt.Errorf("failed to ensure studio config: %w", err)
+	studioCfg, errStudio := EnsureStudioConfig(dataDir, cfg, inheritedProxy)
+	if errStudio != nil {
+		return "", "", nil, fmt.Errorf("failed to ensure studio config: %w", errStudio)
 	}
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", studioCfg.Port)
 	return baseURL, studioCfg.APIKey, cfg, nil
@@ -136,7 +137,13 @@ func AliasGeminiTools(val map[string]any) map[string]string {
 							continue
 						}
 						mapName(fd, "name")
-						if params, ok := fd["parameters"].(map[string]any); ok {
+						paramsRaw, hasParams := fd["parameters"]
+						if !hasParams || paramsRaw == nil {
+							fd["parameters"] = map[string]any{
+								"type":       "OBJECT",
+								"properties": map[string]any{},
+							}
+						} else if params, ok := paramsRaw.(map[string]any); ok {
 							typeVal, hasType := params["type"].(string)
 							isEmptyOrObject := !hasType || strings.EqualFold(typeVal, "object")
 							if isEmptyOrObject {
@@ -218,15 +225,22 @@ func AliasOpenAITools(val map[string]any) map[string]string {
 			}
 			if fn, ok := tool["function"].(map[string]any); ok {
 				mapName(fn, "name")
-				if params, ok := fn["parameters"].(map[string]any); ok {
-					typeVal, hasType := params["type"].(string)
-					isEmptyOrObject := !hasType || strings.EqualFold(typeVal, "object")
-					if isEmptyOrObject {
-						if !hasType {
-							params["type"] = "object"
+				if paramsRaw, hasParams := fn["parameters"]; hasParams {
+					if paramsRaw == nil {
+						fn["parameters"] = map[string]any{
+							"type":       "object",
+							"properties": map[string]any{},
 						}
-						if _, ok := params["properties"]; !ok || params["properties"] == nil {
-							params["properties"] = map[string]any{}
+					} else if params, ok := paramsRaw.(map[string]any); ok {
+						typeVal, hasType := params["type"].(string)
+						isEmptyOrObject := !hasType || strings.EqualFold(typeVal, "object")
+						if isEmptyOrObject {
+							if !hasType {
+								params["type"] = "object"
+							}
+							if _, ok := params["properties"]; !ok || params["properties"] == nil {
+								params["properties"] = map[string]any{}
+							}
 						}
 					}
 				}
@@ -279,6 +293,83 @@ func AliasOpenAITools(val map[string]any) map[string]string {
 	}
 
 	return reverse
+}
+
+// RestoreToolAliasesDoc reverses aliased tool names back to their original identifiers
+// across OpenAI message/delta/function_call structures and Gemini candidate parts using *ojson.Doc.
+func RestoreToolAliasesDoc(doc *ojson.Doc, reverse map[string]string) bool {
+	if len(reverse) == 0 || doc == nil {
+		return false
+	}
+	restored := false
+
+	// OpenAI format: choices[].message or choices[].delta
+	if choices := doc.Get("choices"); choices.IsArray() {
+		choices.ForEach(func(choiceIdx, choice ojson.Result) bool {
+			choicePath := fmt.Sprintf("choices.%d", choiceIdx.Int())
+			for _, containerKey := range []string{"message", "delta"} {
+				container := choice.Get(containerKey)
+				if !container.Exists() {
+					continue
+				}
+				containerPath := choicePath + "." + containerKey
+
+				// function_call.name
+				if fcName := container.Get("function_call.name"); fcName.Type == ojson.String {
+					if orig, ok := reverse[fcName.String()]; ok {
+						_ = doc.Set(containerPath+".function_call.name", orig)
+						restored = true
+					}
+				}
+
+				// tool_calls[].function.name
+				if toolCalls := container.Get("tool_calls"); toolCalls.IsArray() {
+					toolCalls.ForEach(func(callIdx, call ojson.Result) bool {
+						callPath := fmt.Sprintf("%s.tool_calls.%d", containerPath, callIdx.Int())
+						if fnName := call.Get("function.name"); fnName.Type == ojson.String {
+							if orig, ok := reverse[fnName.String()]; ok {
+								_ = doc.Set(callPath+".function.name", orig)
+								restored = true
+							}
+						}
+						return true
+					})
+				}
+			}
+			return true
+		})
+	}
+
+	// Gemini format: candidates[].content.parts[].functionCall
+	candidatesPrefix := "candidates"
+	candidates := doc.Get("candidates")
+	if !candidates.Exists() && doc.Get("response.candidates").Exists() {
+		candidatesPrefix = "response.candidates"
+		candidates = doc.Get("response.candidates")
+	}
+	if candidates.IsArray() {
+		candidates.ForEach(func(candIdx, cand ojson.Result) bool {
+			candPath := fmt.Sprintf("%s.%d", candidatesPrefix, candIdx.Int())
+			parts := cand.Get("content.parts")
+			if parts.IsArray() {
+				parts.ForEach(func(partIdx, part ojson.Result) bool {
+					partPath := fmt.Sprintf("%s.content.parts.%d", candPath, partIdx.Int())
+					for _, key := range []string{"functionCall", "function_call"} {
+						if fcName := part.Get(key + ".name"); fcName.Type == ojson.String {
+							if orig, ok := reverse[fcName.String()]; ok {
+								_ = doc.Set(partPath+"."+key+".name", orig)
+								restored = true
+							}
+						}
+					}
+					return true
+				})
+			}
+			return true
+		})
+	}
+
+	return restored
 }
 
 // RestoreToolAliases reverses aliased tool names back to their original identifiers
@@ -450,6 +541,40 @@ func IsMalformedFinishReason(reason string) bool {
 		strings.EqualFold(reason, "MALFORMED_FUNCTION_CALL")
 }
 
+// GeminiDocHasValidOutput returns true if any candidate part carries non-thought text, tools, or media output.
+func GeminiDocHasValidOutput(doc *ojson.Doc) bool {
+	candidates := doc.Get("candidates")
+	if !candidates.Exists() && doc.Get("response.candidates").Exists() {
+		candidates = doc.Get("response.candidates")
+	}
+	if !candidates.IsArray() {
+		return false
+	}
+	hasValid := false
+	candidates.ForEach(func(_, cand ojson.Result) bool {
+		parts := cand.Get("content.parts")
+		if parts.IsArray() {
+			parts.ForEach(func(_, part ojson.Result) bool {
+				if part.Get("functionCall").Exists() || part.Get("function_call").Exists() ||
+					part.Get("inlineData").Exists() || part.Get("inline_data").Exists() ||
+					part.Get("executableCode").Exists() || part.Get("codeExecutionResult").Exists() {
+					hasValid = true
+					return false
+				}
+				if !part.Get("thought").Bool() {
+					if text := part.Get("text").String(); len(text) > 0 {
+						hasValid = true
+						return false
+					}
+				}
+				return true
+			})
+		}
+		return !hasValid
+	})
+	return hasValid
+}
+
 // GeminiValueHasValidOutput returns true if any candidate part carries non-thought text or tool output.
 func GeminiValueHasValidOutput(val map[string]any) bool {
 	root := val
@@ -488,6 +613,29 @@ func GeminiValueHasValidOutput(val map[string]any) bool {
 	return false
 }
 
+func isGeminiMalformedDoc(doc *ojson.Doc) bool {
+	candidates := doc.Get("candidates")
+	if !candidates.Exists() && doc.Get("response.candidates").Exists() {
+		candidates = doc.Get("response.candidates")
+	}
+	if !candidates.IsArray() {
+		return false
+	}
+	sawMalformed := false
+	candidates.ForEach(func(_, cand ojson.Result) bool {
+		reason := cand.Get("finishReason").String()
+		if reason == "" {
+			reason = cand.Get("finish_reason").String()
+		}
+		if IsMalformedFinishReason(reason) && !GeminiDocHasValidOutput(doc) {
+			sawMalformed = true
+			return false
+		}
+		return true
+	})
+	return sawMalformed
+}
+
 func isGeminiMalformedValue(val map[string]any) bool {
 	root := val
 	if resp, ok := val["response"].(map[string]any); ok {
@@ -509,6 +657,37 @@ func isGeminiMalformedValue(val map[string]any) bool {
 		}
 	}
 	return false
+}
+
+// OpenAIDocHasValidOutput returns true if message or delta contains non-empty content or tool calls.
+func OpenAIDocHasValidOutput(doc *ojson.Doc) bool {
+	choices := doc.Get("choices")
+	if !choices.IsArray() {
+		return false
+	}
+	hasValid := false
+	choices.ForEach(func(_, choice ojson.Result) bool {
+		for _, key := range []string{"message", "delta"} {
+			container := choice.Get(key)
+			if !container.Exists() {
+				continue
+			}
+			if container.Get("function_call").Exists() {
+				hasValid = true
+				return false
+			}
+			if toolCalls := container.Get("tool_calls"); toolCalls.IsArray() && len(toolCalls.Array()) > 0 {
+				hasValid = true
+				return false
+			}
+			if content := container.Get("content").String(); len(content) > 0 {
+				hasValid = true
+				return false
+			}
+		}
+		return true
+	})
+	return hasValid
 }
 
 // OpenAIValueHasValidOutput returns true if message or delta contains non-empty content or tool calls.
@@ -537,6 +716,26 @@ func OpenAIValueHasValidOutput(val map[string]any) bool {
 	return false
 }
 
+func isOpenAIMalformedDoc(doc *ojson.Doc) bool {
+	choices := doc.Get("choices")
+	if !choices.IsArray() {
+		return false
+	}
+	sawMalformed := false
+	choices.ForEach(func(_, choice ojson.Result) bool {
+		reason := choice.Get("finish_reason").String()
+		if reason == "" {
+			reason = choice.Get("finishReason").String()
+		}
+		if IsMalformedFinishReason(reason) && !OpenAIDocHasValidOutput(doc) {
+			sawMalformed = true
+			return false
+		}
+		return true
+	})
+	return sawMalformed
+}
+
 func isOpenAIMalformedValue(val map[string]any) bool {
 	if choices, ok := val["choices"].([]any); ok {
 		for _, rawChoice := range choices {
@@ -556,24 +755,19 @@ func isOpenAIMalformedValue(val map[string]any) bool {
 	return false
 }
 
-// BuildGeminiRetryBody creates a copy of the request payload with perturbed temperature.
-func BuildGeminiRetryBody(base map[string]any, attempt int) map[string]any {
-	if attempt == 0 {
+// BuildGeminiRetryBodyBytes creates a copy of the request payload with perturbed temperature using *ojson.Doc.
+func BuildGeminiRetryBodyBytes(base []byte, attempt int) []byte {
+	if attempt == 0 || len(base) == 0 {
 		return base
 	}
-	cloned := cloneMap(base)
-	target := cloned
-	if req, ok := cloned["request"].(map[string]any); ok {
-		target = req
-	}
-	genCfg, ok := target["generationConfig"].(map[string]any)
-	if !ok || genCfg == nil {
-		genCfg = make(map[string]any)
-		target["generationConfig"] = genCfg
+	doc := ojson.NewDoc(base)
+	path := "generationConfig.temperature"
+	if doc.Get("request").Exists() {
+		path = "request.generationConfig.temperature"
 	}
 	baseTemp := 1.0
-	if t, ok := genCfg["temperature"].(float64); ok {
-		baseTemp = t
+	if t := doc.Get(path); t.Exists() && t.Type == ojson.Number {
+		baseTemp = t.Float()
 	}
 	perturbed := baseTemp + float64(attempt)*0.01
 	if perturbed < 0.01 {
@@ -581,39 +775,63 @@ func BuildGeminiRetryBody(base map[string]any, attempt int) map[string]any {
 	} else if perturbed > 2.0 {
 		perturbed = 2.0
 	}
-	genCfg["temperature"] = perturbed
-	return cloned
+	_ = doc.Set(path, perturbed)
+	return doc.Bytes()
+}
+
+// BuildGeminiRetryBody creates a copy of the request payload with perturbed temperature.
+func BuildGeminiRetryBody(base map[string]any, attempt int) map[string]any {
+	if attempt == 0 || base == nil {
+		return base
+	}
+	b, errMarshal := json.Marshal(base)
+	if errMarshal != nil {
+		return base
+	}
+	ret := BuildGeminiRetryBodyBytes(b, attempt)
+	var out map[string]any
+	_ = json.Unmarshal(ret, &out)
+	return out
+}
+
+// BuildOpenAIRetryBodyBytes creates a copy of the OpenAI chat request with perturbed temperature using *ojson.Doc.
+func BuildOpenAIRetryBodyBytes(base []byte, attempt int) []byte {
+	if attempt == 0 || len(base) == 0 {
+		return base
+	}
+	doc := ojson.NewDoc(base)
+	baseTemp := 1.0
+	if t := doc.Get("temperature"); t.Exists() && t.Type == ojson.Number {
+		baseTemp = t.Float()
+	}
+	perturbed := baseTemp + float64(attempt)*0.01
+	if perturbed < 0.01 {
+		perturbed = 0.01
+	} else if perturbed > 2.0 {
+		perturbed = 2.0
+	}
+	_ = doc.Set("temperature", perturbed)
+	return doc.Bytes()
 }
 
 // BuildOpenAIRetryBody creates a copy of the OpenAI chat request with perturbed temperature.
 func BuildOpenAIRetryBody(base map[string]any, attempt int) map[string]any {
-	if attempt == 0 {
+	if attempt == 0 || base == nil {
 		return base
 	}
-	cloned := cloneMap(base)
-	baseTemp := 1.0
-	if t, ok := cloned["temperature"].(float64); ok {
-		baseTemp = t
+	b, errMarshal := json.Marshal(base)
+	if errMarshal != nil {
+		return base
 	}
-	perturbed := baseTemp + float64(attempt)*0.01
-	if perturbed < 0.01 {
-		perturbed = 0.01
-	} else if perturbed > 2.0 {
-		perturbed = 2.0
-	}
-	cloned["temperature"] = perturbed
-	return cloned
+	ret := BuildOpenAIRetryBodyBytes(b, attempt)
+	var out map[string]any
+	_ = json.Unmarshal(ret, &out)
+	return out
 }
 
-func cloneMap(m map[string]any) map[string]any {
-	b, _ := json.Marshal(m)
-	var cloned map[string]any
-	_ = json.Unmarshal(b, &cloned)
-	return cloned
-}
-
-func getForwardHTTPClient(proxyURL string) *http.Client {
+func getForwardHTTPClient() *http.Client {
 	transport := &http.Transport{
+		Proxy: nil, // Loopback forwarding must never route through outbound proxy
 		DialContext: (&net.Dialer{
 			Timeout:   15 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -624,22 +842,337 @@ func getForwardHTTPClient(proxyURL string) *http.Client {
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
-	if strings.TrimSpace(proxyURL) != "" {
-		if parsed, err := url.Parse(strings.TrimSpace(proxyURL)); err == nil {
-			transport.Proxy = http.ProxyURL(parsed)
-		}
-	}
 	return &http.Client{
 		Transport: transport,
-		// Timeout: 0 - post-connection timeouts are forbidden per AGENTS.md
+	}
+}
+
+type tokenAccounting struct {
+	inputTokens     int64
+	outputTokens    int64
+	reasoningTokens int64
+	totalTokens     int64
+	cachedTokens    int64
+}
+
+func extractGeminiDocUsage(doc *ojson.Doc, acc *tokenAccounting) {
+	meta := doc.Get("usageMetadata")
+	if !meta.Exists() && doc.Get("response.usageMetadata").Exists() {
+		meta = doc.Get("response.usageMetadata")
+	}
+	if !meta.Exists() {
+		return
+	}
+	if p := meta.Get("promptTokenCount").Int(); p > 0 {
+		acc.inputTokens = p
+	}
+	if c := meta.Get("candidatesTokenCount").Int(); c > 0 {
+		acc.outputTokens = c
+	}
+	if t := meta.Get("totalTokenCount").Int(); t > 0 {
+		acc.totalTokens = t
+	}
+	if th := meta.Get("thoughtsTokenCount").Int(); th > 0 {
+		acc.reasoningTokens = th
+	}
+	if ca := meta.Get("cachedContentTokenCount").Int(); ca > 0 {
+		acc.cachedTokens = ca
+	}
+}
+
+func extractOpenAIDocUsage(doc *ojson.Doc, acc *tokenAccounting) {
+	u := doc.Get("usage")
+	if !u.Exists() {
+		return
+	}
+	if p := u.Get("prompt_tokens").Int(); p > 0 {
+		acc.inputTokens = p
+	}
+	if c := u.Get("completion_tokens").Int(); c > 0 {
+		acc.outputTokens = c
+	}
+	if t := u.Get("total_tokens").Int(); t > 0 {
+		acc.totalTokens = t
+	}
+	if th := u.Get("completion_tokens_details.reasoning_tokens").Int(); th > 0 {
+		acc.reasoningTokens = th
+	}
+	if ca := u.Get("prompt_tokens_details.cached_tokens").Int(); ca > 0 {
+		acc.cachedTokens = ca
+	}
+}
+
+func rewriteGeminiDocModel(doc *ojson.Doc) {
+	if mv := doc.Get("modelVersion"); mv.Exists() && mv.String() != "" {
+		_ = doc.Set("modelVersion", PrefixMagpieModel(mv.String()))
+	}
+	if mv := doc.Get("response.modelVersion"); mv.Exists() && mv.String() != "" {
+		_ = doc.Set("response.modelVersion", PrefixMagpieModel(mv.String()))
+	}
+	if m := doc.Get("model"); m.Exists() && m.String() != "" {
+		_ = doc.Set("model", PrefixMagpieModel(m.String()))
+	}
+	if m := doc.Get("response.model"); m.Exists() && m.String() != "" {
+		_ = doc.Set("response.model", PrefixMagpieModel(m.String()))
+	}
+}
+
+func rewriteOpenAIDocModel(doc *ojson.Doc, prefixedModel string) {
+	if doc.Get("model").Exists() {
+		_ = doc.Set("model", prefixedModel)
+	}
+}
+
+type sseForwardParams struct {
+	w               http.ResponseWriter
+	r               *http.Request
+	client          *http.Client
+	targetURL       string
+	authHeaders     map[string]string
+	baseBodyBytes   []byte
+	perturbBody     func(base []byte, attempt int) []byte
+	transformDoc    func(doc *ojson.Doc, isCommitCandidate *bool, isMalformed *bool, acc *tokenAccounting)
+	logName         string
+	provider        string
+	prefixedModel   string
+	apiKeyPrincipal string
+	reqID           string
+	traceID         string
+	startTime       time.Time
+}
+
+func forwardSSEStream(params sseForwardParams) {
+	params.w.Header().Set("Content-Type", "text/event-stream")
+	params.w.Header().Set("Cache-Control", "no-cache")
+	params.w.Header().Set("Connection", "keep-alive")
+	params.w.Header().Set("X-Accel-Buffering", "no")
+	flusher, _ := params.w.(http.Flusher)
+
+	var acc tokenAccounting
+
+	for attempt := 0; attempt <= MaxMalformedRetries; attempt++ {
+		bodyBytes := params.perturbBody(params.baseBodyBytes, attempt)
+
+		upstreamReq, errReq := http.NewRequestWithContext(params.r.Context(), "POST", params.targetURL, bytes.NewReader(bodyBytes))
+		if errReq != nil {
+			http.Error(params.w, fmt.Sprintf("Failed to construct upstream request: %v", errReq), http.StatusInternalServerError)
+			return
+		}
+		for k, v := range params.authHeaders {
+			upstreamReq.Header.Set(k, v)
+		}
+		upstreamReq.Header.Set("Content-Type", "application/json")
+
+		resp, errDo := params.client.Do(upstreamReq)
+		if errDo != nil {
+			if attempt == 0 {
+				var errJSON []byte
+				if params.logName == "Gemini" {
+					errJSON, _ = json.Marshal(map[string]any{
+						"error": map[string]any{
+							"code":    502,
+							"message": fmt.Sprintf("Failed to reach MAGPIE backend: %v", errDo),
+							"status":  "UNAVAILABLE",
+						},
+					})
+				} else {
+					errJSON, _ = json.Marshal(map[string]any{
+						"error": map[string]any{
+							"message": fmt.Sprintf("Failed to reach MAGPIE backend: %v", errDo),
+							"type":    "api_error",
+							"code":    "bad_gateway",
+						},
+					})
+				}
+				_, _ = fmt.Fprintf(params.w, "data: %s\n\n", string(errJSON))
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+			return
+		}
+
+		cType := resp.Header.Get("Content-Type")
+		if resp.StatusCode != http.StatusOK && !strings.Contains(cType, "text/event-stream") {
+			params.w.WriteHeader(resp.StatusCode)
+			_, _ = io.Copy(params.w, resp.Body)
+			if errClose := resp.Body.Close(); errClose != nil {
+				log.Debugf("failed to close response body: %v", errClose)
+			}
+			return
+		}
+
+		reader := bufio.NewReader(resp.Body)
+		var preYieldFrames [][]byte
+		committed := false
+		sawMalformed := false
+
+		for {
+			line, errReadLine := reader.ReadString('\n')
+			if len(line) > 0 {
+				outLine := line
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, "data:") {
+					payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+					if payload == "[DONE]" {
+						outLine = "data: [DONE]\n\n"
+					} else if payload != "" {
+						doc := ojson.NewDoc([]byte(payload))
+						if doc.Get("@this").Exists() {
+							params.transformDoc(doc, &committed, &sawMalformed, &acc)
+							outLine = fmt.Sprintf("data: %s\n\n", doc.String())
+						}
+					}
+				}
+
+				if committed {
+					_, _ = params.w.Write([]byte(outLine))
+					if flusher != nil {
+						flusher.Flush()
+					}
+				} else {
+					preYieldFrames = append(preYieldFrames, []byte(outLine))
+				}
+			}
+			if errReadLine != nil {
+				break
+			}
+		}
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Debugf("failed to close streaming response body: %v", errClose)
+		}
+
+		if !committed && sawMalformed && attempt < MaxMalformedRetries {
+			log.Warnf("[MAGPIE] %s SSE stream returned malformed reply with no valid output; retrying silently (%d/%d)", params.logName, attempt+1, MaxMalformedRetries)
+			continue
+		}
+
+		for _, f := range preYieldFrames {
+			_, _ = params.w.Write(f)
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+
+		coreusage.PublishRecord(params.r.Context(), coreusage.Record{
+			RequestID:   params.reqID,
+			TraceID:     params.traceID,
+			Provider:    params.provider,
+			Model:       params.prefixedModel,
+			APIKey:      params.apiKeyPrincipal,
+			Stream:      true,
+			RequestedAt: params.startTime,
+			Latency:     time.Since(params.startTime),
+			Detail: coreusage.Detail{
+				InputTokens:     acc.inputTokens,
+				OutputTokens:    acc.outputTokens,
+				ReasoningTokens: acc.reasoningTokens,
+				TotalTokens:     acc.totalTokens,
+				CachedTokens:    acc.cachedTokens,
+			},
+		})
+		return
+	}
+}
+
+type jsonForwardParams struct {
+	w               http.ResponseWriter
+	r               *http.Request
+	client          *http.Client
+	targetURL       string
+	authHeaders     map[string]string
+	baseBodyBytes   []byte
+	perturbBody     func(base []byte, attempt int) []byte
+	isMalformedDoc  func(doc *ojson.Doc) bool
+	transformDoc    func(doc *ojson.Doc, acc *tokenAccounting)
+	logName         string
+	provider        string
+	prefixedModel   string
+	apiKeyPrincipal string
+	reqID           string
+	traceID         string
+	startTime       time.Time
+}
+
+func forwardJSONRequest(params jsonForwardParams) {
+	for attempt := 0; attempt <= MaxMalformedRetries; attempt++ {
+		bodyBytes := params.perturbBody(params.baseBodyBytes, attempt)
+
+		upstreamReq, errReq := http.NewRequestWithContext(params.r.Context(), "POST", params.targetURL, bytes.NewReader(bodyBytes))
+		if errReq != nil {
+			http.Error(params.w, fmt.Sprintf("Failed to construct upstream request: %v", errReq), http.StatusInternalServerError)
+			return
+		}
+		for k, v := range params.authHeaders {
+			upstreamReq.Header.Set(k, v)
+		}
+		upstreamReq.Header.Set("Content-Type", "application/json")
+
+		resp, errDo := params.client.Do(upstreamReq)
+		if errDo != nil {
+			http.Error(params.w, fmt.Sprintf("Failed to reach MAGPIE backend: %v", errDo), http.StatusBadGateway)
+			return
+		}
+
+		respBytes, errRead := io.ReadAll(resp.Body)
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Debugf("failed to close response body: %v", errClose)
+		}
+		if errRead != nil {
+			http.Error(params.w, fmt.Sprintf("Failed to read response: %v", errRead), http.StatusBadGateway)
+			return
+		}
+
+		doc := ojson.NewDoc(respBytes)
+		if doc.Get("@this").Exists() && resp.StatusCode == http.StatusOK {
+			if params.isMalformedDoc(doc) && attempt < MaxMalformedRetries {
+				log.Warnf("[MAGPIE] %s JSON response returned malformed reply with no valid output; retrying silently (%d/%d)", params.logName, attempt+1, MaxMalformedRetries)
+				continue
+			}
+
+			var acc tokenAccounting
+			params.transformDoc(doc, &acc)
+
+			coreusage.PublishRecord(params.r.Context(), coreusage.Record{
+				RequestID:   params.reqID,
+				TraceID:     params.traceID,
+				Provider:    params.provider,
+				Model:       params.prefixedModel,
+				APIKey:      params.apiKeyPrincipal,
+				Stream:      false,
+				RequestedAt: params.startTime,
+				Latency:     time.Since(params.startTime),
+				Detail: coreusage.Detail{
+					InputTokens:     acc.inputTokens,
+					OutputTokens:    acc.outputTokens,
+					ReasoningTokens: acc.reasoningTokens,
+					TotalTokens:     acc.totalTokens,
+					CachedTokens:    acc.cachedTokens,
+				},
+			})
+
+			params.w.Header().Set("Content-Type", "application/json")
+			params.w.WriteHeader(resp.StatusCode)
+			_, _ = params.w.Write(doc.Bytes())
+			return
+		}
+
+		for k, vv := range resp.Header {
+			for _, v := range vv {
+				params.w.Header().Add(k, v)
+			}
+		}
+		params.w.WriteHeader(resp.StatusCode)
+		_, _ = params.w.Write(respBytes)
+		return
 	}
 }
 
 // ForwardGeminiRequest handles forwarding of Gemini requests to the local MAGPIE daemon.
 func ForwardGeminiRequest(w http.ResponseWriter, r *http.Request, rawModel, method string, rawBody []byte, inheritedProxy string, apiKeyPrincipal string) {
-	baseURL, apiKey, magpieCfg, err := InternalBaseURLAndKey(r.Context(), inheritedProxy)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("MAGPIE backend error: %v", err), http.StatusBadGateway)
+	baseURL, apiKey, magpieCfg, errInternal := InternalBaseURLAndKey(r.Context(), inheritedProxy)
+	if errInternal != nil {
+		http.Error(w, fmt.Sprintf("MAGPIE backend error: %v", errInternal), http.StatusBadGateway)
 		return
 	}
 
@@ -669,6 +1202,7 @@ func ForwardGeminiRequest(w http.ResponseWriter, r *http.Request, rawModel, meth
 		StripGeminiImages(bodyMap)
 	}
 	reverseToolMap := AliasGeminiTools(bodyMap)
+	baseBodyBytes, _ := json.Marshal(bodyMap)
 
 	basePath := fmt.Sprintf("%s/v1beta/models/%s:%s", baseURL, cleanRawModel, method)
 	targetURL := basePath
@@ -684,7 +1218,7 @@ func ForwardGeminiRequest(w http.ResponseWriter, r *http.Request, rawModel, meth
 		}
 	}
 
-	client := getForwardHTTPClient(ResolveMagpieProxy(magpieCfg, inheritedProxy))
+	client := getForwardHTTPClient()
 	isStreaming := (method == "streamGenerateContent")
 	startTime := time.Now()
 
@@ -695,273 +1229,72 @@ func ForwardGeminiRequest(w http.ResponseWriter, r *http.Request, rawModel, meth
 	}
 	traceID := coreusage.TraceIDFromContext(r.Context())
 
+	authHeaders := map[string]string{
+		"Authorization":  fmt.Sprintf("Bearer %s", apiKey),
+		"x-goog-api-key": apiKey,
+	}
+
 	if isStreaming {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
-		flusher, _ := w.(http.Flusher)
-
-		var inputTokens, outputTokens, reasoningTokens, totalTokens int64
-
-		for attempt := 0; attempt <= MaxMalformedRetries; attempt++ {
-			reqBody := BuildGeminiRetryBody(bodyMap, attempt)
-			bodyBytes, _ := json.Marshal(reqBody)
-
-			upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, bytes.NewReader(bodyBytes))
-			if err != nil {
-				http.Error(w, fmt.Sprintf("Failed to construct upstream request: %v", err), http.StatusInternalServerError)
-				return
-			}
-			upstreamReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
-			upstreamReq.Header.Set("x-goog-api-key", apiKey)
-			upstreamReq.Header.Set("Content-Type", "application/json")
-
-			resp, err := client.Do(upstreamReq)
-			if err != nil {
-				if attempt == 0 {
-					errJSON, _ := json.Marshal(map[string]any{
-						"error": map[string]any{
-							"code":    502,
-							"message": fmt.Sprintf("Failed to reach MAGPIE backend: %v", err),
-							"status":  "UNAVAILABLE",
-						},
-					})
-					_, _ = fmt.Fprintf(w, "data: %s\n\n", string(errJSON))
-					if flusher != nil {
-						flusher.Flush()
+		forwardSSEStream(sseForwardParams{
+			w:               w,
+			r:               r,
+			client:          client,
+			targetURL:       targetURL,
+			authHeaders:     authHeaders,
+			baseBodyBytes:   baseBodyBytes,
+			perturbBody:     BuildGeminiRetryBodyBytes,
+			logName:         "Gemini",
+			provider:        "magpie",
+			prefixedModel:   prefixedModel,
+			apiKeyPrincipal: apiKeyPrincipal,
+			reqID:           reqID,
+			traceID:         traceID,
+			startTime:       startTime,
+			transformDoc: func(doc *ojson.Doc, isCommitCandidate *bool, isMalformed *bool, acc *tokenAccounting) {
+				RestoreToolAliasesDoc(doc, reverseToolMap)
+				rewriteGeminiDocModel(doc)
+				extractGeminiDocUsage(doc, acc)
+				if !*isCommitCandidate {
+					if GeminiDocHasValidOutput(doc) {
+						*isCommitCandidate = true
+					} else if isGeminiMalformedDoc(doc) {
+						*isMalformed = true
 					}
 				}
-				return
-			}
-
-			cType := resp.Header.Get("Content-Type")
-			if resp.StatusCode != http.StatusOK && !strings.Contains(cType, "text/event-stream") {
-				w.WriteHeader(resp.StatusCode)
-				_, _ = io.Copy(w, resp.Body)
-				_ = resp.Body.Close()
-				return
-			}
-
-			reader := bufio.NewReader(resp.Body)
-			var preYieldFrames [][]byte
-			committed := false
-			sawMalformed := false
-
-			for {
-				line, err := reader.ReadString('\n')
-				if len(line) > 0 {
-					outLine := line
-					trimmed := strings.TrimSpace(line)
-					if strings.HasPrefix(trimmed, "data:") {
-						payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
-						if payload != "" && payload != "[DONE]" {
-							var val map[string]any
-							if err := json.Unmarshal([]byte(payload), &val); err == nil {
-								RestoreToolAliases(val, reverseToolMap)
-								// Rewrite model
-								root := val
-								if r, ok := val["response"].(map[string]any); ok {
-									root = r
-								}
-								if mv, ok := root["modelVersion"].(string); ok && mv != "" {
-									root["modelVersion"] = PrefixMagpieModel(mv)
-								}
-								if m, ok := root["model"].(string); ok && m != "" {
-									root["model"] = PrefixMagpieModel(m)
-								}
-
-								// Token accounting
-								if meta, ok := root["usageMetadata"].(map[string]any); ok {
-									getInt := func(k string) int64 {
-										if f, ok := meta[k].(float64); ok {
-											return int64(f)
-										}
-										return 0
-									}
-									if p := getInt("promptTokenCount"); p > 0 {
-										inputTokens = p
-									}
-									if c := getInt("candidatesTokenCount"); c > 0 {
-										outputTokens = c
-									}
-									if t := getInt("totalTokenCount"); t > 0 {
-										totalTokens = t
-									}
-									if th := getInt("thoughtsTokenCount"); th > 0 {
-										reasoningTokens = th
-									}
-								}
-
-								if !committed {
-									if GeminiValueHasValidOutput(val) {
-										committed = true
-										for _, f := range preYieldFrames {
-											_, _ = w.Write(f)
-										}
-										preYieldFrames = nil
-									} else if isGeminiMalformedValue(val) {
-										sawMalformed = true
-									}
-								}
-
-								if serialized, err := json.Marshal(val); err == nil {
-									outLine = fmt.Sprintf("data: %s\n", string(serialized))
-								}
-							}
-						}
-					}
-
-					if committed {
-						_, _ = w.Write([]byte(outLine))
-						if flusher != nil {
-							flusher.Flush()
-						}
-					} else {
-						preYieldFrames = append(preYieldFrames, []byte(outLine))
-					}
-				}
-				if err != nil {
-					break
-				}
-			}
-			_ = resp.Body.Close()
-
-			if !committed && sawMalformed && attempt < MaxMalformedRetries {
-				log.Warnf("[MAGPIE] Gemini SSE stream returned MALFORMED_RESPONSE with no valid output; retrying silently (%d/%d)", attempt+1, MaxMalformedRetries)
-				continue
-			}
-
-			// If not committed, flush buffered pre-yield frames
-			for _, f := range preYieldFrames {
-				_, _ = w.Write(f)
-			}
-			if flusher != nil {
-				flusher.Flush()
-			}
-
-			// Record usage
-			coreusage.PublishRecord(r.Context(), coreusage.Record{
-				RequestID:   reqID,
-				TraceID:     traceID,
-				Provider:    "magpie",
-				Model:       prefixedModel,
-				APIKey:      apiKeyPrincipal,
-				Stream:      true,
-				RequestedAt: startTime,
-				Latency:     time.Since(startTime),
-				Detail: coreusage.Detail{
-					InputTokens:     inputTokens,
-					OutputTokens:    outputTokens,
-					ReasoningTokens: reasoningTokens,
-					TotalTokens:     totalTokens,
-				},
-			})
-			return
-		}
+			},
+		})
 		return
 	}
 
-	// Non-streaming JSON request
-	for attempt := 0; attempt <= MaxMalformedRetries; attempt++ {
-		reqBody := BuildGeminiRetryBody(bodyMap, attempt)
-		bodyBytes, _ := json.Marshal(reqBody)
-
-		upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, bytes.NewReader(bodyBytes))
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to construct upstream request: %v", err), http.StatusInternalServerError)
-			return
-		}
-		upstreamReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
-		upstreamReq.Header.Set("x-goog-api-key", apiKey)
-		upstreamReq.Header.Set("Content-Type", "application/json")
-
-		resp, err := client.Do(upstreamReq)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to reach MAGPIE backend: %v", err), http.StatusBadGateway)
-			return
-		}
-
-		respBytes, err := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to read response: %v", err), http.StatusBadGateway)
-			return
-		}
-
-		var jsonVal map[string]any
-		if err := json.Unmarshal(respBytes, &jsonVal); err == nil && resp.StatusCode == http.StatusOK {
-			if isGeminiMalformedValue(jsonVal) && attempt < MaxMalformedRetries {
-				log.Warnf("[MAGPIE] Gemini JSON response returned MALFORMED_RESPONSE with no valid output; retrying silently (%d/%d)", attempt+1, MaxMalformedRetries)
-				continue
-			}
-
-			RestoreToolAliases(jsonVal, reverseToolMap)
-			root := jsonVal
-			if resObj, ok := jsonVal["response"].(map[string]any); ok {
-				root = resObj
-			}
-			if mv, ok := root["modelVersion"].(string); ok && mv != "" {
-				root["modelVersion"] = PrefixMagpieModel(mv)
-			}
-			if m, ok := root["model"].(string); ok && m != "" {
-				root["model"] = PrefixMagpieModel(m)
-			}
-
-			var inputTokens, outputTokens, reasoningTokens, totalTokens int64
-			if meta, ok := root["usageMetadata"].(map[string]any); ok {
-				getInt := func(k string) int64 {
-					if f, ok := meta[k].(float64); ok {
-						return int64(f)
-					}
-					return 0
-				}
-				inputTokens = getInt("promptTokenCount")
-				outputTokens = getInt("candidatesTokenCount")
-				totalTokens = getInt("totalTokenCount")
-				reasoningTokens = getInt("thoughtsTokenCount")
-			}
-
-			coreusage.PublishRecord(r.Context(), coreusage.Record{
-				RequestID:   reqID,
-				TraceID:     traceID,
-				Provider:    "magpie",
-				Model:       prefixedModel,
-				APIKey:      apiKeyPrincipal,
-				Stream:      false,
-				RequestedAt: startTime,
-				Latency:     time.Since(startTime),
-				Detail: coreusage.Detail{
-					InputTokens:     inputTokens,
-					OutputTokens:    outputTokens,
-					ReasoningTokens: reasoningTokens,
-					TotalTokens:     totalTokens,
-				},
-			})
-
-			outBytes, _ := json.Marshal(jsonVal)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(resp.StatusCode)
-			_, _ = w.Write(outBytes)
-			return
-		}
-
-		for k, vv := range resp.Header {
-			for _, v := range vv {
-				w.Header().Add(k, v)
-			}
-		}
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(respBytes)
-		return
-	}
+	forwardJSONRequest(jsonForwardParams{
+		w:               w,
+		r:               r,
+		client:          client,
+		targetURL:       targetURL,
+		authHeaders:     authHeaders,
+		baseBodyBytes:   baseBodyBytes,
+		perturbBody:     BuildGeminiRetryBodyBytes,
+		isMalformedDoc:  isGeminiMalformedDoc,
+		logName:         "Gemini",
+		provider:        "magpie",
+		prefixedModel:   prefixedModel,
+		apiKeyPrincipal: apiKeyPrincipal,
+		reqID:           reqID,
+		traceID:         traceID,
+		startTime:       startTime,
+		transformDoc: func(doc *ojson.Doc, acc *tokenAccounting) {
+			RestoreToolAliasesDoc(doc, reverseToolMap)
+			rewriteGeminiDocModel(doc)
+			extractGeminiDocUsage(doc, acc)
+		},
+	})
 }
 
 // ForwardOpenAIChatRequest handles forwarding of OpenAI chat completion requests to the local MAGPIE daemon.
 func ForwardOpenAIChatRequest(w http.ResponseWriter, r *http.Request, rawModel string, rawBody []byte, inheritedProxy string, apiKeyPrincipal string) {
-	baseURL, apiKey, magpieCfg, err := InternalBaseURLAndKey(r.Context(), inheritedProxy)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("MAGPIE backend error: %v", err), http.StatusBadGateway)
+	baseURL, apiKey, magpieCfg, errInternal := InternalBaseURLAndKey(r.Context(), inheritedProxy)
+	if errInternal != nil {
+		http.Error(w, fmt.Sprintf("MAGPIE backend error: %v", errInternal), http.StatusBadGateway)
 		return
 	}
 
@@ -983,7 +1316,6 @@ func ForwardOpenAIChatRequest(w http.ResponseWriter, r *http.Request, rawModel s
 		bodyMap = make(map[string]any)
 	}
 
-	// Downstream request model sent to internal daemon must have MAGPIE prefix stripped
 	bodyMap["model"] = cleanRawModel
 
 	// Apply feature toggles
@@ -994,9 +1326,10 @@ func ForwardOpenAIChatRequest(w http.ResponseWriter, r *http.Request, rawModel s
 		StripOpenAIImages(bodyMap)
 	}
 	reverseToolMap := AliasOpenAITools(bodyMap)
+	baseBodyBytes, _ := json.Marshal(bodyMap)
 
 	targetURL := fmt.Sprintf("%s/v1/chat/completions", baseURL)
-	client := getForwardHTTPClient(ResolveMagpieProxy(magpieCfg, inheritedProxy))
+	client := getForwardHTTPClient()
 	isStreamReq, _ := bodyMap["stream"].(bool)
 	startTime := time.Now()
 
@@ -1007,254 +1340,62 @@ func ForwardOpenAIChatRequest(w http.ResponseWriter, r *http.Request, rawModel s
 	}
 	traceID := coreusage.TraceIDFromContext(r.Context())
 
+	authHeaders := map[string]string{
+		"Authorization": fmt.Sprintf("Bearer %s", apiKey),
+	}
+
 	if isStreamReq {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
-		flusher, _ := w.(http.Flusher)
-
-		var inputTokens, outputTokens, reasoningTokens, totalTokens int64
-
-		for attempt := 0; attempt <= MaxMalformedRetries; attempt++ {
-			reqBody := BuildOpenAIRetryBody(bodyMap, attempt)
-			bodyBytes, _ := json.Marshal(reqBody)
-
-			upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, bytes.NewReader(bodyBytes))
-			if err != nil {
-				http.Error(w, fmt.Sprintf("Failed to construct upstream request: %v", err), http.StatusInternalServerError)
-				return
-			}
-			upstreamReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
-			upstreamReq.Header.Set("Content-Type", "application/json")
-
-			resp, err := client.Do(upstreamReq)
-			if err != nil {
-				if attempt == 0 {
-					errJSON, _ := json.Marshal(map[string]any{
-						"error": map[string]any{
-							"message": fmt.Sprintf("Failed to reach MAGPIE backend: %v", err),
-							"type":    "api_error",
-							"code":    "bad_gateway",
-						},
-					})
-					_, _ = fmt.Fprintf(w, "data: %s\n\n", string(errJSON))
-					if flusher != nil {
-						flusher.Flush()
+		forwardSSEStream(sseForwardParams{
+			w:               w,
+			r:               r,
+			client:          client,
+			targetURL:       targetURL,
+			authHeaders:     authHeaders,
+			baseBodyBytes:   baseBodyBytes,
+			perturbBody:     BuildOpenAIRetryBodyBytes,
+			logName:         "OpenAI",
+			provider:        "magpie",
+			prefixedModel:   prefixedModel,
+			apiKeyPrincipal: apiKeyPrincipal,
+			reqID:           reqID,
+			traceID:         traceID,
+			startTime:       startTime,
+			transformDoc: func(doc *ojson.Doc, isCommitCandidate *bool, isMalformed *bool, acc *tokenAccounting) {
+				RestoreToolAliasesDoc(doc, reverseToolMap)
+				rewriteOpenAIDocModel(doc, prefixedModel)
+				extractOpenAIDocUsage(doc, acc)
+				if !*isCommitCandidate {
+					if OpenAIDocHasValidOutput(doc) {
+						*isCommitCandidate = true
+					} else if isOpenAIMalformedDoc(doc) {
+						*isMalformed = true
 					}
 				}
-				return
-			}
-
-			cType := resp.Header.Get("Content-Type")
-			if resp.StatusCode != http.StatusOK && !strings.Contains(cType, "text/event-stream") {
-				w.WriteHeader(resp.StatusCode)
-				_, _ = io.Copy(w, resp.Body)
-				_ = resp.Body.Close()
-				return
-			}
-
-			reader := bufio.NewReader(resp.Body)
-			var preYieldFrames [][]byte
-			committed := false
-			sawMalformed := false
-
-			for {
-				line, err := reader.ReadString('\n')
-				if len(line) > 0 {
-					outLine := line
-					trimmed := strings.TrimSpace(line)
-					if strings.HasPrefix(trimmed, "data:") {
-						payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
-						if payload == "[DONE]" {
-							outLine = "data: [DONE]\n\n"
-						} else if payload != "" {
-							var val map[string]any
-							if err := json.Unmarshal([]byte(payload), &val); err == nil {
-								RestoreToolAliases(val, reverseToolMap)
-								if _, ok := val["model"]; ok {
-									val["model"] = prefixedModel
-								}
-
-								// Extract usage if available
-								if u, ok := val["usage"].(map[string]any); ok {
-									getInt := func(k string) int64 {
-										if f, ok := u[k].(float64); ok {
-											return int64(f)
-										}
-										return 0
-									}
-									if p := getInt("prompt_tokens"); p > 0 {
-										inputTokens = p
-									}
-									if c := getInt("completion_tokens"); c > 0 {
-										outputTokens = c
-									}
-									if t := getInt("total_tokens"); t > 0 {
-										totalTokens = t
-									}
-									if details, ok := u["completion_tokens_details"].(map[string]any); ok {
-										if r, ok := details["reasoning_tokens"].(float64); ok {
-											reasoningTokens = int64(r)
-										}
-									}
-								}
-
-								if !committed {
-									if OpenAIValueHasValidOutput(val) {
-										committed = true
-										for _, f := range preYieldFrames {
-											_, _ = w.Write(f)
-										}
-										preYieldFrames = nil
-									} else if isOpenAIMalformedValue(val) {
-										sawMalformed = true
-									}
-								}
-
-								if serialized, err := json.Marshal(val); err == nil {
-									outLine = fmt.Sprintf("data: %s\n\n", string(serialized))
-								}
-							}
-						}
-					}
-
-					if committed {
-						_, _ = w.Write([]byte(outLine))
-						if flusher != nil {
-							flusher.Flush()
-						}
-					} else {
-						preYieldFrames = append(preYieldFrames, []byte(outLine))
-					}
-				}
-				if err != nil {
-					break
-				}
-			}
-			_ = resp.Body.Close()
-
-			if !committed && sawMalformed && attempt < MaxMalformedRetries {
-				log.Warnf("[MAGPIE] OpenAI SSE stream returned malformed finish_reason with no valid output; retrying silently (%d/%d)", attempt+1, MaxMalformedRetries)
-				continue
-			}
-
-			// If not committed, flush whatever was buffered
-			for _, f := range preYieldFrames {
-				_, _ = w.Write(f)
-			}
-			if flusher != nil {
-				flusher.Flush()
-			}
-
-			coreusage.PublishRecord(r.Context(), coreusage.Record{
-				RequestID:   reqID,
-				TraceID:     traceID,
-				Provider:    "magpie",
-				Model:       prefixedModel,
-				APIKey:      apiKeyPrincipal,
-				Stream:      true,
-				RequestedAt: startTime,
-				Latency:     time.Since(startTime),
-				Detail: coreusage.Detail{
-					InputTokens:     inputTokens,
-					OutputTokens:    outputTokens,
-					ReasoningTokens: reasoningTokens,
-					TotalTokens:     totalTokens,
-				},
-			})
-			return
-		}
+			},
+		})
 		return
 	}
 
-	// Non-streaming JSON request
-	for attempt := 0; attempt <= MaxMalformedRetries; attempt++ {
-		reqBody := BuildOpenAIRetryBody(bodyMap, attempt)
-		bodyBytes, _ := json.Marshal(reqBody)
-
-		upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, bytes.NewReader(bodyBytes))
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to construct upstream request: %v", err), http.StatusInternalServerError)
-			return
-		}
-		upstreamReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
-		upstreamReq.Header.Set("Content-Type", "application/json")
-
-		resp, err := client.Do(upstreamReq)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to reach MAGPIE backend: %v", err), http.StatusBadGateway)
-			return
-		}
-
-		respBytes, err := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to read response: %v", err), http.StatusBadGateway)
-			return
-		}
-
-		var jsonVal map[string]any
-		if err := json.Unmarshal(respBytes, &jsonVal); err == nil && resp.StatusCode == http.StatusOK {
-			if isOpenAIMalformedValue(jsonVal) && attempt < MaxMalformedRetries {
-				log.Warnf("[MAGPIE] OpenAI JSON response returned malformed finish_reason with no valid output; retrying silently (%d/%d)", attempt+1, MaxMalformedRetries)
-				continue
-			}
-
-			RestoreToolAliases(jsonVal, reverseToolMap)
-			if _, ok := jsonVal["model"]; ok {
-				jsonVal["model"] = prefixedModel
-			}
-
-			var inputTokens, outputTokens, reasoningTokens, totalTokens int64
-			if u, ok := jsonVal["usage"].(map[string]any); ok {
-				getInt := func(k string) int64 {
-					if f, ok := u[k].(float64); ok {
-						return int64(f)
-					}
-					return 0
-				}
-				inputTokens = getInt("prompt_tokens")
-				outputTokens = getInt("completion_tokens")
-				totalTokens = getInt("total_tokens")
-				if details, ok := u["completion_tokens_details"].(map[string]any); ok {
-					if r, ok := details["reasoning_tokens"].(float64); ok {
-						reasoningTokens = int64(r)
-					}
-				}
-			}
-
-			coreusage.PublishRecord(r.Context(), coreusage.Record{
-				RequestID:   reqID,
-				TraceID:     traceID,
-				Provider:    "magpie",
-				Model:       prefixedModel,
-				APIKey:      apiKeyPrincipal,
-				Stream:      false,
-				RequestedAt: startTime,
-				Latency:     time.Since(startTime),
-				Detail: coreusage.Detail{
-					InputTokens:     inputTokens,
-					OutputTokens:    outputTokens,
-					ReasoningTokens: reasoningTokens,
-					TotalTokens:     totalTokens,
-				},
-			})
-
-			outBytes, _ := json.Marshal(jsonVal)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(resp.StatusCode)
-			_, _ = w.Write(outBytes)
-			return
-		}
-
-		for k, vv := range resp.Header {
-			for _, v := range vv {
-				w.Header().Add(k, v)
-			}
-		}
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(respBytes)
-		return
-	}
+	forwardJSONRequest(jsonForwardParams{
+		w:               w,
+		r:               r,
+		client:          client,
+		targetURL:       targetURL,
+		authHeaders:     authHeaders,
+		baseBodyBytes:   baseBodyBytes,
+		perturbBody:     BuildOpenAIRetryBodyBytes,
+		isMalformedDoc:  isOpenAIMalformedDoc,
+		logName:         "OpenAI",
+		provider:        "magpie",
+		prefixedModel:   prefixedModel,
+		apiKeyPrincipal: apiKeyPrincipal,
+		reqID:           reqID,
+		traceID:         traceID,
+		startTime:       startTime,
+		transformDoc: func(doc *ojson.Doc, acc *tokenAccounting) {
+			RestoreToolAliasesDoc(doc, reverseToolMap)
+			rewriteOpenAIDocModel(doc, prefixedModel)
+			extractOpenAIDocUsage(doc, acc)
+		},
+	})
 }
