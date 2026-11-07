@@ -170,20 +170,177 @@ func ToggleAccount(ctx context.Context, dataDir string, cfg *MagpieConfig, inher
 	return res, nil
 }
 
+var loginTaskPollInterval = 250 * time.Millisecond
+
+func runStudioLoginTask(ctx context.Context, dataDir string, reqPath string, accountID string) (any, error) {
+	resBytes, err := StudioAdminRequest(ctx, dataDir, "POST", reqPath, map[string]any{}, 15*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+
+	var res map[string]any
+	if errUnmarshal := json.Unmarshal(resBytes, &res); errUnmarshal != nil {
+		var genericRes any
+		_ = json.Unmarshal(resBytes, &genericRes)
+		return genericRes, nil
+	}
+
+	taskRaw, hasTask := res["task"]
+	taskMap, isTaskMap := taskRaw.(map[string]any)
+	if !hasTask || !isTaskMap || taskMap == nil {
+		return res, nil
+	}
+
+	taskID, _ := taskMap["id"].(string)
+	if strings.TrimSpace(taskID) == "" {
+		return res, nil
+	}
+
+	// Always cleanup the task on completion or context cancellation so running browser tasks are cancelled
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_, _ = StudioAdminRequest(cleanupCtx, dataDir, "DELETE", "/api/accounts/tasks/"+url.PathEscape(taskID), nil, 3*time.Second)
+	}()
+
+	currentTask := taskMap
+	for {
+		state, _ := currentTask["state"].(string)
+		if state != "running" && state != "pending" {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(loginTaskPollInterval):
+		}
+
+		tasksBytes, errPoll := StudioAdminRequest(ctx, dataDir, "GET", "/api/accounts/tasks", nil, 5*time.Second)
+		if errPoll != nil {
+			return nil, fmt.Errorf("failed to poll login tasks: %w", errPoll)
+		}
+
+		var tasksList []any
+		var tasksWrapper map[string]any
+		if errTasks := json.Unmarshal(tasksBytes, &tasksWrapper); errTasks == nil {
+			if tList, ok := tasksWrapper["tasks"].([]any); ok {
+				tasksList = tList
+			}
+		} else {
+			_ = json.Unmarshal(tasksBytes, &tasksList)
+		}
+
+		var found map[string]any
+		for _, item := range tasksList {
+			if m, ok := item.(map[string]any); ok {
+				if id, ok := m["id"].(string); ok && id == taskID {
+					found = m
+					break
+				}
+			}
+		}
+
+		if found == nil {
+			return nil, fmt.Errorf("login task disappeared before completion")
+		}
+		currentTask = found
+	}
+
+	finalState, _ := currentTask["state"].(string)
+	var firstItemState string
+	var firstItemError string
+	var firstItemLabel string
+	if items, ok := currentTask["items"].([]any); ok && len(items) > 0 {
+		if item0, ok := items[0].(map[string]any); ok {
+			firstItemState, _ = item0["state"].(string)
+			firstItemError, _ = item0["error"].(string)
+			firstItemLabel, _ = item0["label"].(string)
+		}
+	}
+
+	if finalState == "failed" || firstItemState == "failed" {
+		errMsg := strings.TrimSpace(firstItemError)
+		if errMsg == "" {
+			errMsg = "Google login failed"
+		}
+		return nil, fmt.Errorf("%s", errMsg)
+	}
+
+	if finalState != "done" {
+		return nil, fmt.Errorf("unexpected login task state: %s", finalState)
+	}
+
+	// Once done, call GET /api/accounts to find the matching account
+	accBytes, errAccounts := StudioAdminRequest(ctx, dataDir, "GET", "/api/accounts", nil, 5*time.Second)
+	if errAccounts != nil {
+		return nil, fmt.Errorf("failed to fetch accounts after login task completion: %w", errAccounts)
+	}
+
+	var accList []any
+	var accWrapper map[string]any
+	if errAcc := json.Unmarshal(accBytes, &accWrapper); errAcc == nil {
+		if l, ok := accWrapper["accounts"].([]any); ok {
+			accList = l
+		}
+	} else {
+		_ = json.Unmarshal(accBytes, &accList)
+	}
+
+	var matchedAccount map[string]any
+	for _, rawItem := range accList {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			continue
+		}
+		itemID, _ := item["id"].(string)
+		if itemID == "" {
+			itemID, _ = item["account_id"].(string)
+		}
+		itemLabel, _ := item["label"].(string)
+
+		match := false
+		if accountID != "" {
+			if strings.EqualFold(itemID, accountID) || strings.EqualFold(itemLabel, accountID) {
+				match = true
+			}
+		}
+		if !match && firstItemLabel != "" {
+			if strings.EqualFold(itemID, firstItemLabel) || strings.EqualFold(itemLabel, firstItemLabel) {
+				match = true
+			}
+		}
+		if match {
+			matchedAccount = item
+			break
+		}
+	}
+
+	if matchedAccount == nil && len(accList) == 1 && accountID == "" {
+		if first, ok := accList[0].(map[string]any); ok {
+			matchedAccount = first
+		}
+	}
+
+	if accountID != "" && matchedAccount != nil {
+		if accState, _ := matchedAccount["state"].(string); accState == "auth_required" {
+			return nil, fmt.Errorf("account %s still requires authentication", accountID)
+		}
+	}
+
+	return map[string]any{
+		"account": matchedAccount,
+		"task":    currentTask,
+	}, nil
+}
+
 // LoginNewAccount initiates an interactive browser login session via Camoufox to add a new account.
 func LoginNewAccount(ctx context.Context, dataDir string, cfg *MagpieConfig, inheritedProxy string) (any, error) {
 	if err := EnsureRunning(ctx, dataDir, cfg, inheritedProxy); err != nil {
 		return nil, fmt.Errorf("failed to ensure backend running: %w", err)
 	}
-
-	resBytes, err := StudioAdminRequest(ctx, dataDir, "POST", "/api/accounts", map[string]any{}, 15*time.Minute)
-	if err != nil {
-		return nil, err
-	}
-	InvalidateModelsCache()
-	var res any
-	_ = json.Unmarshal(resBytes, &res)
-	return res, nil
+	defer InvalidateModelsCache()
+	return runStudioLoginTask(ctx, dataDir, "/api/accounts", "")
 }
 
 // ReloginAccount initiates an interactive browser re-login session via Camoufox for an existing account.
@@ -207,16 +364,9 @@ func ReloginAccount(ctx context.Context, dataDir string, cfg *MagpieConfig, inhe
 	if err := EnsureRunning(ctx, dataDir, cfg, inheritedProxy); err != nil {
 		return nil, fmt.Errorf("failed to ensure backend running: %w", err)
 	}
-
+	defer InvalidateModelsCache()
 	reqPath := fmt.Sprintf("/api/accounts/%s/login", url.PathEscape(accountID))
-	resBytes, err := StudioAdminRequest(ctx, dataDir, "POST", reqPath, map[string]any{}, 15*time.Minute)
-	if err != nil {
-		return nil, err
-	}
-	InvalidateModelsCache()
-	var res any
-	_ = json.Unmarshal(resBytes, &res)
-	return res, nil
+	return runStudioLoginTask(ctx, dataDir, reqPath, accountID)
 }
 
 // DeleteAccount removes an account from the running backend and deletes its storage state files.

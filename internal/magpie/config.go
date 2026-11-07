@@ -284,7 +284,6 @@ var EnvKeys = []string{
 	"UPSTREAM_CHANNELS",
 	"MODEL_MAPPING",
 	"MODEL_CHANNELS",
-	"TEMPORARY_CHAT",
 	"WAA_BACKEND",
 	"MEDIA_OUTPUT",
 	"MEDIA_BASE_URL",
@@ -299,6 +298,7 @@ var EnvKeys = []string{
 	"NONSTREAM_KEEPALIVE",
 	"FAKE_STREAM",
 	"YOUTUBE_LINKS",
+	"STRIP_THOUGHT_SIGNATURES",
 	"SEARCH_MODEL_ALIASES",
 	"GOOGLE_SEARCH",
 	"FIRST_EVENT_HEDGE",
@@ -311,7 +311,6 @@ var EnvKeys = []string{
 var SettingDefaults = map[string]string{
 	"REQUEST_BODY_LOG":         "false",
 	"LOG_FILE":                 "false",
-	"TEMPORARY_CHAT":           "true",
 	"PER_ACCOUNT_CONCURRENCY":  "1",
 	"WARM_WORKER_LIMIT":        "1",
 	"MAX_ACTIVE_WORKERS":       "1",

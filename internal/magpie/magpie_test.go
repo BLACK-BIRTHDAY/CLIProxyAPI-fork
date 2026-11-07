@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1041,4 +1042,430 @@ func TestFetchMagpieModelsInMemoryCacheAndInvalidation(t *testing.T) {
 	if len(modelsReloaded) != 0 {
 		t.Fatalf("expected empty models after cache invalidation, got: %v", modelsReloaded)
 	}
+}
+
+func TestFilterStudioModels_DeepResearch(t *testing.T) {
+	rawCatalog := []map[string]any{
+		{
+			"id":                           "deep-research-preview-04-2026",
+			"name":                         "Deep Research Preview",
+			"supported_generation_methods": []any{"generateContent"},
+			"capabilities": map[string]any{
+				"chat_model":        true,
+				"interaction_route": true,
+				"interactions_api":  true,
+			},
+		},
+		{
+			"id":                           "deep-research-max-preview-04-2026",
+			"name":                         "Deep Research Max Preview",
+			"supported_generation_methods": []any{"generateContent"},
+			"capabilities": map[string]any{
+				"chat_model":        true,
+				"interaction_route": true,
+				"interactions_api":  true,
+			},
+		},
+		{
+			"id":                           "deep-research-no-route",
+			"name":                         "Deep Research Without Route",
+			"supported_generation_methods": []any{"generateContent"},
+			"capabilities": map[string]any{
+				"chat_model": true,
+			},
+		},
+		{
+			"id":                           "deep-research-speech",
+			"name":                         "Deep Research Speech",
+			"supported_generation_methods": []any{"generateContent"},
+			"capabilities": map[string]any{
+				"chat_model":        true,
+				"interaction_route": true,
+				"speech_route":      true,
+			},
+		},
+	}
+
+	filtered := FilterStudioModels(rawCatalog, false)
+	idMap := make(map[string]bool)
+	for _, m := range filtered {
+		idMap[m.ID] = true
+	}
+
+	if !idMap["deep-research-preview-04-2026"] {
+		t.Errorf("expected deep-research-preview-04-2026 to be included")
+	}
+	if !idMap["deep-research-max-preview-04-2026"] {
+		t.Errorf("expected deep-research-max-preview-04-2026 to be included")
+	}
+	if idMap["deep-research-no-route"] {
+		t.Errorf("deep-research-no-route should be excluded (interaction_route != true)")
+	}
+	if idMap["deep-research-speech"] {
+		t.Errorf("deep-research-speech should be excluded (speech_route is not allowed)")
+	}
+}
+
+func setupMockStudioDaemon(t *testing.T, handler http.Handler) (dataDir string, cleanup func()) {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	tmpDir := t.TempDir()
+
+	port := server.Listener.Addr().(*net.TCPAddr).Port
+	cfg := StudioConfigFile{
+		Version:       1,
+		Port:          port,
+		APIKey:        "as_mock_key",
+		AdminUsername: "magpie",
+		AdminPassword: "mock_password",
+	}
+	cfgBytes, _ := json.MarshalIndent(cfg, "", "  ")
+	_ = os.WriteFile(filepath.Join(tmpDir, "config.json"), cfgBytes, 0600)
+
+	origInterval := loginTaskPollInterval
+	loginTaskPollInterval = 1 * time.Millisecond
+
+	return tmpDir, func() {
+		loginTaskPollInterval = origInterval
+		server.Close()
+	}
+}
+
+func TestLoginTasks_AsyncPollingAndCleanup(t *testing.T) {
+	// 1. LoginNewAccount async task success + cleanup DELETE
+	t.Run("login_new_account_async_success", func(t *testing.T) {
+		var mu sync.Mutex
+		var requests []string
+		pollCount := 0
+
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			requests = append(requests, r.Method+" "+r.URL.Path)
+			mu.Unlock()
+
+			if r.URL.Path == "/api/auth/login" {
+				http.SetCookie(w, &http.Cookie{Name: "aistudio_admin", Value: "token123"})
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"success":true}`))
+				return
+			}
+			if r.URL.Path == "/api/status" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"running":true,"ready":true,"state":"RUNNING"}`))
+				return
+			}
+			if r.Method == "POST" && r.URL.Path == "/api/accounts" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"task":{"id":"task-new-1","state":"running","items":[{"label":"new-acc@gmail.com","state":"running"}]}}`))
+				return
+			}
+			if r.Method == "GET" && r.URL.Path == "/api/accounts/tasks" {
+				pollCount++
+				state := "running"
+				if pollCount >= 2 {
+					state = "done"
+				}
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"tasks": []any{
+						map[string]any{
+							"id":    "task-new-1",
+							"state": state,
+							"items": []any{
+								map[string]any{
+									"label": "new-acc@gmail.com",
+									"state": state,
+								},
+							},
+						},
+					},
+				})
+				return
+			}
+			if r.Method == "GET" && r.URL.Path == "/api/accounts" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"accounts":[{"id":"acc-id-123","label":"new-acc@gmail.com","state":"ready"}]}`))
+				return
+			}
+			if r.Method == "DELETE" && r.URL.Path == "/api/accounts/tasks/task-new-1" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"success":true}`))
+				return
+			}
+			http.NotFound(w, r)
+		})
+
+		dataDir, cleanup := setupMockStudioDaemon(t, handler)
+		defer cleanup()
+
+		cfg := NewDefaultConfig()
+		res, err := LoginNewAccount(context.Background(), dataDir, cfg, "")
+		if err != nil {
+			t.Fatalf("LoginNewAccount failed: %v", err)
+		}
+
+		resMap, ok := res.(map[string]any)
+		if !ok {
+			t.Fatalf("expected map[string]any result, got %T: %v", res, res)
+		}
+		acc, ok := resMap["account"].(map[string]any)
+		if !ok || acc["id"] != "acc-id-123" {
+			t.Errorf("account id = %v, want 'acc-id-123'", acc["id"])
+		}
+
+		// Verify DELETE cleanup was called
+		mu.Lock()
+		defer mu.Unlock()
+		hasDelete := false
+		for _, req := range requests {
+			if req == "DELETE /api/accounts/tasks/task-new-1" {
+				hasDelete = true
+				break
+			}
+		}
+		if !hasDelete {
+			t.Errorf("expected DELETE /api/accounts/tasks/task-new-1 in requests: %v", requests)
+		}
+	})
+
+	// 2. LoginNewAccount direct account response (legacy compatibility)
+	t.Run("login_new_account_immediate_account", func(t *testing.T) {
+		var mu sync.Mutex
+		var requests []string
+
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			requests = append(requests, r.Method+" "+r.URL.Path)
+			mu.Unlock()
+
+			if r.URL.Path == "/api/auth/login" {
+				http.SetCookie(w, &http.Cookie{Name: "aistudio_admin", Value: "token123"})
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"success":true}`))
+				return
+			}
+			if r.URL.Path == "/api/status" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"running":true,"ready":true,"state":"RUNNING"}`))
+				return
+			}
+			if r.Method == "POST" && r.URL.Path == "/api/accounts" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"account":{"id":"legacy-acc","label":"legacy@gmail.com"}}`))
+				return
+			}
+			http.NotFound(w, r)
+		})
+
+		dataDir, cleanup := setupMockStudioDaemon(t, handler)
+		defer cleanup()
+
+		cfg := NewDefaultConfig()
+		res, err := LoginNewAccount(context.Background(), dataDir, cfg, "")
+		if err != nil {
+			t.Fatalf("LoginNewAccount failed: %v", err)
+		}
+
+		resMap, ok := res.(map[string]any)
+		if !ok {
+			t.Fatalf("expected map[string]any, got %T: %v", res, res)
+		}
+		acc, ok := resMap["account"].(map[string]any)
+		if !ok || acc["id"] != "legacy-acc" {
+			t.Errorf("account id = %v, want 'legacy-acc'", acc["id"])
+		}
+
+		// Verify no tasks DELETE was called
+		mu.Lock()
+		defer mu.Unlock()
+		for _, req := range requests {
+			if strings.HasPrefix(req, "DELETE /api/accounts/tasks") {
+				t.Errorf("unexpected DELETE for immediate account: %s", req)
+			}
+		}
+	})
+
+	// 3. ReloginAccount task failure surfaces item error and runs cleanup DELETE
+	t.Run("relogin_account_task_failed", func(t *testing.T) {
+		var mu sync.Mutex
+		var requests []string
+
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			requests = append(requests, r.Method+" "+r.URL.Path)
+			mu.Unlock()
+
+			if r.URL.Path == "/api/auth/login" {
+				http.SetCookie(w, &http.Cookie{Name: "aistudio_admin", Value: "token123"})
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"success":true}`))
+				return
+			}
+			if r.URL.Path == "/api/status" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"running":true,"ready":true,"state":"RUNNING"}`))
+				return
+			}
+			if r.Method == "POST" && r.URL.Path == "/api/accounts/target-acc/login" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"task":{"id":"task-relogin-fail","state":"running","items":[{"label":"target-acc","state":"running"}]}}`))
+				return
+			}
+			if r.Method == "GET" && r.URL.Path == "/api/accounts/tasks" {
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"tasks": []any{
+						map[string]any{
+							"id":    "task-relogin-fail",
+							"state": "failed",
+							"items": []any{
+								map[string]any{
+									"label": "target-acc",
+									"state": "failed",
+									"error": "2FA verification rejected",
+								},
+							},
+						},
+					},
+				})
+				return
+			}
+			if r.Method == "DELETE" && r.URL.Path == "/api/accounts/tasks/task-relogin-fail" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"success":true}`))
+				return
+			}
+			http.NotFound(w, r)
+		})
+
+		dataDir, cleanup := setupMockStudioDaemon(t, handler)
+		defer cleanup()
+
+		cfg := NewDefaultConfig()
+		_, err := ReloginAccount(context.Background(), dataDir, cfg, "", "target-acc")
+		if err == nil {
+			t.Fatalf("ReloginAccount expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "2FA verification rejected") {
+			t.Errorf("error = %q, want containing '2FA verification rejected'", err.Error())
+		}
+
+		// Verify DELETE was called
+		mu.Lock()
+		defer mu.Unlock()
+		hasDelete := false
+		for _, req := range requests {
+			if req == "DELETE /api/accounts/tasks/task-relogin-fail" {
+				hasDelete = true
+				break
+			}
+		}
+		if !hasDelete {
+			t.Errorf("expected DELETE /api/accounts/tasks/task-relogin-fail in requests: %v", requests)
+		}
+	})
+
+	// 4. ReloginAccount account still in auth_required state after completion
+	t.Run("relogin_account_auth_required_error", func(t *testing.T) {
+		var mu sync.Mutex
+		var requests []string
+
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			requests = append(requests, r.Method+" "+r.URL.Path)
+			mu.Unlock()
+
+			if r.URL.Path == "/api/auth/login" {
+				http.SetCookie(w, &http.Cookie{Name: "aistudio_admin", Value: "token123"})
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"success":true}`))
+				return
+			}
+			if r.URL.Path == "/api/status" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"running":true,"ready":true,"state":"RUNNING"}`))
+				return
+			}
+			if r.Method == "POST" && r.URL.Path == "/api/accounts/acc-req/login" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"task":{"id":"task-auth-req","state":"done","items":[{"label":"acc-req","state":"done"}]}}`))
+				return
+			}
+			if r.Method == "GET" && r.URL.Path == "/api/accounts" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"accounts":[{"id":"acc-req","label":"acc-req","state":"auth_required"}]}`))
+				return
+			}
+			if r.Method == "DELETE" && r.URL.Path == "/api/accounts/tasks/task-auth-req" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"success":true}`))
+				return
+			}
+			http.NotFound(w, r)
+		})
+
+		dataDir, cleanup := setupMockStudioDaemon(t, handler)
+		defer cleanup()
+
+		cfg := NewDefaultConfig()
+		_, err := ReloginAccount(context.Background(), dataDir, cfg, "", "acc-req")
+		if err == nil {
+			t.Fatalf("ReloginAccount expected error when account state is auth_required, got nil")
+		}
+		if !strings.Contains(err.Error(), "requires authentication") {
+			t.Errorf("error = %q, want containing 'requires authentication'", err.Error())
+		}
+	})
+
+	// 5. Task disappears before completion returns error
+	t.Run("task_disappears_error", func(t *testing.T) {
+		var mu sync.Mutex
+		var requests []string
+
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			requests = append(requests, r.Method+" "+r.URL.Path)
+			mu.Unlock()
+
+			if r.URL.Path == "/api/auth/login" {
+				http.SetCookie(w, &http.Cookie{Name: "aistudio_admin", Value: "token123"})
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"success":true}`))
+				return
+			}
+			if r.URL.Path == "/api/status" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"running":true,"ready":true,"state":"RUNNING"}`))
+				return
+			}
+			if r.Method == "POST" && r.URL.Path == "/api/accounts" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"task":{"id":"task-vanish","state":"running","items":[{"label":"acc","state":"running"}]}}`))
+				return
+			}
+			if r.Method == "GET" && r.URL.Path == "/api/accounts/tasks" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"tasks":[]}`)) // Empty tasks list
+				return
+			}
+			if r.Method == "DELETE" && r.URL.Path == "/api/accounts/tasks/task-vanish" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"success":true}`))
+				return
+			}
+			http.NotFound(w, r)
+		})
+
+		dataDir, cleanup := setupMockStudioDaemon(t, handler)
+		defer cleanup()
+
+		cfg := NewDefaultConfig()
+		_, err := LoginNewAccount(context.Background(), dataDir, cfg, "")
+		if err == nil {
+			t.Fatalf("LoginNewAccount expected error when task disappears, got nil")
+		}
+		if !strings.Contains(err.Error(), "login task disappeared before completion") {
+			t.Errorf("error = %q, want containing 'login task disappeared before completion'", err.Error())
+		}
+	})
 }

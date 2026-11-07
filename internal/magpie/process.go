@@ -22,7 +22,7 @@ import (
 
 const (
 	// MagpieStudioVersion is the pinned upstream AIStudio2API release version.
-	MagpieStudioVersion = "0.2.19-magpie.1"
+	MagpieStudioVersion = "0.3.0-magpie.1"
 	// PreinstalledMagpieBin is the container-bundled binary path for Cloud Run.
 	PreinstalledMagpieBin = "/app/magpie/aistudio2api"
 )

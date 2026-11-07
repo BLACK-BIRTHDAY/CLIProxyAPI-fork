@@ -1,0 +1,105 @@
+name: Upstream Sync
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+  issues: write
+
+jobs:
+  sync:
+    name: Dual-Upstream Sync & Verification
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      verified: ${{ steps.sync.outputs.verified }}
+      summary: ${{ steps.sync.outputs.summary }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Configure Git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Run Dual-Upstream Sync Agent
+        id: sync
+        env:
+          UPSTREAM_AGENT_BASE_URL: ${{ secrets.UPSTREAM_AGENT_BASE_URL || 'https://antigravity-manager-963915716511.asia-northeast2.run.app/v1' }}
+          UPSTREAM_AGENT_API_KEY: ${{ secrets.UPSTREAM_AGENT_API_KEY }}
+          UPSTREAM_AGENT_MODEL: ${{ vars.UPSTREAM_AGENT_MODEL || 'gemini-3.8-flash-high' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node scripts/ci-upstream-agent.mjs --sync-ci
+
+      - name: Promote and push verified changes
+        if: steps.sync.outputs.changed == 'true' && steps.sync.outputs.verified == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          git add -A
+          if ! git diff-index --quiet HEAD --; then
+            git commit -m "chore(upstream): auto-sync CLIProxyAPI and magpie-gemini-web"
+          fi
+          git push origin main
+          git push origin HEAD:refs/heads/feat/magpie-cloud-run
+
+      - name: Quarantine failed sync attempt
+        if: steps.sync.outputs.verified == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          FAILED_BRANCH="upstream-sync/failed-${GITHUB_RUN_ID}"
+          git checkout -b "$FAILED_BRANCH"
+          git add -A
+          if ! git diff-index --quiet HEAD --; then
+            git commit -m "chore(upstream): quarantine failed sync attempt for run ${GITHUB_RUN_ID}" --allow-empty
+          else
+            git commit --allow-empty -m "chore(upstream): quarantine failed sync attempt for run ${GITHUB_RUN_ID}"
+          fi
+          git push origin "$FAILED_BRANCH"
+
+          SUMMARY="${{ steps.sync.outputs.summary }}"
+          gh issue create \
+            --title "Upstream Sync Failure (Run #${GITHUB_RUN_ID})" \
+            --body "Automated Dual-Upstream Convergence failed verification in run #${GITHUB_RUN_ID}.
+
+          **Quarantine Branch:** \`$FAILED_BRANCH\`
+          **Run ID:** \`$GITHUB_RUN_ID\`
+
+          ### Diagnostic Summary
+          ${SUMMARY:-No summary provided.}
+
+          Please inspect the quarantine branch, resolve the remaining issues, and promote to \`main\`."
+
+          echo "::error::Upstream convergence failed verification. Quarantined in $FAILED_BRANCH."
+          exit 1
+
+  publish:
+    name: Publish Container
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' && needs.sync.outputs.verified == 'true'
+    uses: ./.github/workflows/docker-publish.yml
+    secrets: inherit

@@ -76,3 +76,22 @@ _Avoid_: One-way tool truncation, global tool registry
 An upstream completion response that terminates with a malformed-generation finish reason without emitting any visible text or tool calls, which the gateway intercepts before streaming to the client and silently retries.
 _Avoid_: Empty stream bug, continuation prompt
 
+### Automated Dual-Upstream Convergence
+
+**Studio Release Pin**:
+The version tag and archive/binary SHA-256 digests that lock the container's pre-installed MAGPIE Backend binary to a verified release from `BUKOWSKIREAL/magpie-gemini-web`.
+_Avoid_: Binary version, studio tag, hardcoded hash
+
+**Dual-Upstream Sync Cycle**:
+A scheduled or manually dispatched reconciliation run that merges upstream `router-for-me/CLIProxyAPI` commits and advances the Studio Release Pin from `BUKOWSKIREAL/magpie-gemini-web` before publishing a refreshed container image.
+_Avoid_: Auto-update job, cron merge, fork sync
+
+**Agentic Conflict Resolution**:
+An automated repair loop invoked during a Dual-Upstream Sync Cycle when a git merge conflict, upstream MAGPIE contract delta, or build/test failure occurs, using a tool-calling LLM agent bounded by compilation and unit-test verification gates.
+_Avoid_: AI merge, auto-fix script, blind conflict resolution
+
+**Quarantine Sync Branch**:
+An isolated branch pushed when a Dual-Upstream Sync Cycle fails verification after exhausting Agentic Conflict Resolution, preserving the unmerged state and diagnostic logs without advancing `main` or publishing a container image.
+_Avoid_: Failed branch, broken main, dirty sync
+
+

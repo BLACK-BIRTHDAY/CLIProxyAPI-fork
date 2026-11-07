@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -241,5 +242,91 @@ func TestNormalizeWorkerLimits(t *testing.T) {
 	}
 	if startup < 1 || startup > max {
 		t.Errorf("startup = %d, want between 1 and max (%d)", startup, max)
+	}
+}
+
+func TestGetInstallStatus_ManifestVersion(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("K_SERVICE", "")
+	t.Setenv("MAGPIE_PREINSTALLED_BIN", filepath.Join(t.TempDir(), "nonexistent"))
+
+	// Create fake binary so installed is true
+	binName := "aistudio2api"
+	if os.PathSeparator == '\\' {
+		binName = "aistudio2api.exe"
+	}
+	pkgDir := filepath.Join(tmpDir, "package")
+	_ = os.MkdirAll(pkgDir, 0755)
+	_ = os.WriteFile(filepath.Join(pkgDir, binName), []byte("fake binary"), 0755)
+
+	// 1. Current pinned version (0.3.0-magpie.1)
+	manifestPath := filepath.Join(tmpDir, "install-manifest.json")
+	_ = os.WriteFile(manifestPath, []byte(`{"version":"0.3.0-magpie.1"}`), 0644)
+	stValid := GetInstallStatus(tmpDir)
+	if !stValid.ManifestValid {
+		t.Errorf("GetInstallStatus().ManifestValid = false, want true for version 0.3.0-magpie.1")
+	}
+	if stValid.Version != "0.3.0-magpie.1" {
+		t.Errorf("GetInstallStatus().Version = %q, want '0.3.0-magpie.1'", stValid.Version)
+	}
+
+	// 2. Old version (0.2.19-magpie.1) should now be invalid
+	_ = os.WriteFile(manifestPath, []byte(`{"version":"0.2.19-magpie.1"}`), 0644)
+	stOld := GetInstallStatus(tmpDir)
+	if stOld.ManifestValid {
+		t.Errorf("GetInstallStatus().ManifestValid = true, want false for old version 0.2.19-magpie.1")
+	}
+}
+
+func TestEnvKeys_StripThoughtSignaturesAndNoTemporaryChat(t *testing.T) {
+	// 1. Check TEMPORARY_CHAT is completely absent from EnvKeys and SettingDefaults
+	for _, key := range EnvKeys {
+		if key == "TEMPORARY_CHAT" {
+			t.Errorf("EnvKeys still contains obsolete TEMPORARY_CHAT")
+		}
+	}
+	if _, ok := SettingDefaults["TEMPORARY_CHAT"]; ok {
+		t.Errorf("SettingDefaults still contains obsolete TEMPORARY_CHAT")
+	}
+
+	// 2. Check STRIP_THOUGHT_SIGNATURES is in EnvKeys right after YOUTUBE_LINKS
+	foundStrip := false
+	for i, key := range EnvKeys {
+		if key == "STRIP_THOUGHT_SIGNATURES" {
+			foundStrip = true
+			if i == 0 || EnvKeys[i-1] != "YOUTUBE_LINKS" {
+				t.Errorf("STRIP_THOUGHT_SIGNATURES should be right after YOUTUBE_LINKS, but previous is %q", EnvKeys[i-1])
+			}
+			break
+		}
+	}
+	if !foundStrip {
+		t.Errorf("EnvKeys missing STRIP_THOUGHT_SIGNATURES")
+	}
+
+	// 3. Test SyncStudioEnv writes STRIP_THOUGHT_SIGNATURES and does not emit TEMPORARY_CHAT
+	tmpDir := t.TempDir()
+	envPath := filepath.Join(tmpDir, ".env")
+	_ = os.WriteFile(envPath, []byte("STRIP_THOUGHT_SIGNATURES=true\n"), 0600)
+	studioCfg := &StudioConfigFile{
+		Port:          2048,
+		APIKey:        "as_test",
+		AdminUsername: "magpie",
+		AdminPassword: "pwd",
+	}
+	cfg := NewDefaultConfig()
+	if err := SyncStudioEnv(tmpDir, studioCfg, cfg, ""); err != nil {
+		t.Fatalf("SyncStudioEnv failed: %v", err)
+	}
+	writtenBytes, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("failed to read .env: %v", err)
+	}
+	written := string(writtenBytes)
+	if !strings.Contains(written, "STRIP_THOUGHT_SIGNATURES=true") {
+		t.Errorf(".env missing STRIP_THOUGHT_SIGNATURES=true: %s", written)
+	}
+	if strings.Contains(written, "TEMPORARY_CHAT") {
+		t.Errorf(".env should not contain TEMPORARY_CHAT: %s", written)
 	}
 }

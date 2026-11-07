@@ -126,7 +126,12 @@ func FilterStudioModels(rawModels []map[string]any, allowImageModels bool) []Mag
 
 	for _, item := range rawModels {
 		id, ok := item["id"].(string)
-		if !ok || id == "" || !strings.HasPrefix(id, "gemini-") {
+		if !ok || id == "" {
+			continue
+		}
+		caps, _ := item["capabilities"].(map[string]any)
+		isResearch := strings.HasPrefix(id, "deep-research-") && caps != nil && caps["interaction_route"] == true
+		if !strings.HasPrefix(id, "gemini-") && !isResearch {
 			continue
 		}
 		lowerID := strings.ToLower(id)
@@ -157,7 +162,6 @@ func FilterStudioModels(rawModels []map[string]any, allowImageModels bool) []Mag
 		}
 
 		// capabilities
-		caps, _ := item["capabilities"].(map[string]any)
 		chatModel := true
 		if caps != nil {
 			if v, ok := caps["chat_model"].(bool); ok {
@@ -184,7 +188,7 @@ func FilterStudioModels(rawModels []map[string]any, allowImageModels bool) []Mag
 			if !allowImageModels {
 				continue
 			}
-		} else if reExclude.MatchString(id) {
+		} else if !isResearch && reExclude.MatchString(id) {
 			continue
 		}
 
@@ -193,7 +197,7 @@ func FilterStudioModels(rawModels []map[string]any, allowImageModels bool) []Mag
 			hasDisallowedNonText := false
 			for _, capName := range nonTextCaps {
 				if isSet, ok := caps[capName].(bool); ok && isSet {
-					if !(isImage && imageCaps[capName]) {
+					if !(isImage && imageCaps[capName]) && !(isResearch && capName == "interactions_api") {
 						hasDisallowedNonText = true
 						break
 					}
