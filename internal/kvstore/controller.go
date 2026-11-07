@@ -2,6 +2,9 @@ package kvstore
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	log "github.com/sirupsen/logrus"
@@ -48,6 +51,20 @@ func ConfigureLocal(enabled bool, rawPath string) error {
 		return errResolve
 	}
 
+	// On Cloud Run (K_SERVICE != ""), bbolt cannot run safely on GCS FUSE mounts because
+	// FUSE lacks full mmap and file locking support. Redirect to container-local /tmp/.
+	isCloudRun := os.Getenv("K_SERVICE") != ""
+	tmpDBPath := filepath.Join(os.TempDir(), "cpa-kv.db")
+	if isCloudRun {
+		isUnderTmp := strings.HasPrefix(filepath.ToSlash(rawPath), "/tmp/") ||
+			strings.HasPrefix(filepath.ToSlash(resolvedPath), "/tmp/") ||
+			strings.HasPrefix(filepath.Clean(resolvedPath), filepath.Clean(os.TempDir()))
+		if !isUnderTmp {
+			log.Warnf("[KVSTORE] Cloud Run detected (K_SERVICE=%s); redirecting kv store from %s to %s to prevent GCS FUSE locking errors", os.Getenv("K_SERVICE"), resolvedPath, tmpDBPath)
+			resolvedPath = tmpDBPath
+		}
+	}
+
 	if localStore != nil && localPath == resolvedPath && localErr == nil {
 		localEnabled = true
 		return nil
@@ -63,6 +80,17 @@ func ConfigureLocal(enabled bool, rawPath string) error {
 
 	store, errOpen := OpenBoltStore(resolvedPath)
 	if errOpen != nil {
+		if isCloudRun && resolvedPath != tmpDBPath {
+			log.Warnf("[KVSTORE] Failed to open kv store at %s (%v); falling back to %s", resolvedPath, errOpen, tmpDBPath)
+			fallbackStore, errFallback := OpenBoltStore(tmpDBPath)
+			if errFallback == nil {
+				localEnabled = true
+				localStore = fallbackStore
+				localPath = tmpDBPath
+				localErr = nil
+				return nil
+			}
+		}
 		localEnabled = true
 		localErr = errOpen
 		log.Errorf("local kv store open failed (path=%s): %v", resolvedPath, errOpen)

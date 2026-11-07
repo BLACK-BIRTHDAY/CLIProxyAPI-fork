@@ -16,6 +16,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	. "github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/magpie"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 )
@@ -81,6 +82,17 @@ func (h *GeminiAPIHandler) GeminiModels(c *gin.Context) {
 	for _, model := range rawModels {
 		normalizedModels = append(normalizedModels, normalizeGeminiModelMap(model))
 	}
+	proxyURL := ""
+	if cfg := h.CurrentConfig(); cfg != nil {
+		proxyURL = cfg.ProxyURL
+	}
+	reqCtx := context.Background()
+	if c.Request != nil && c.Request.Context() != nil {
+		reqCtx = c.Request.Context()
+	}
+	for _, m := range magpie.FetchMagpieModels(reqCtx, proxyURL) {
+		normalizedModels = append(normalizedModels, magpie.ToGeminiModelMap(m))
+	}
 	h.WriteModelListResponse(c, h.HandlerType(), gin.H{
 		"models": normalizedModels,
 	})
@@ -102,6 +114,35 @@ func (h *GeminiAPIHandler) GeminiGetHandler(c *gin.Context) {
 		return
 	}
 	action := strings.TrimPrefix(request.Action, "/")
+
+	if rawModel, ok := magpie.StripMagpiePrefix(action); ok {
+		proxyURL := ""
+		if cfg := h.CurrentConfig(); cfg != nil {
+			proxyURL = cfg.ProxyURL
+		}
+		reqCtx := context.Background()
+		if c.Request != nil && c.Request.Context() != nil {
+			reqCtx = c.Request.Context()
+		}
+		magpieModels := magpie.FetchMagpieModels(reqCtx, proxyURL)
+		for _, m := range magpieModels {
+			if m.ID == rawModel || m.PrefixedID == action || m.PrefixedID == magpie.PrefixMagpieModel(rawModel) {
+				c.JSON(http.StatusOK, magpie.ToGeminiModelMap(m))
+				return
+			}
+		}
+		fallback := magpie.MagpieModelInfo{
+			ID:                         rawModel,
+			PrefixedID:                 magpie.PrefixMagpieModel(rawModel),
+			DisplayName:                magpie.PrefixMagpieModel(rawModel),
+			Description:                fmt.Sprintf("Google AI Studio model: %s", rawModel),
+			InputTokenLimit:            1048576,
+			OutputTokenLimit:           65536,
+			SupportedGenerationMethods: []string{"generateContent", "streamGenerateContent", "countTokens"},
+		}
+		c.JSON(http.StatusOK, magpie.ToGeminiModelMap(fallback))
+		return
+	}
 
 	// Get dynamic models from the global registry and find the matching one
 	availableModels := h.Models()
@@ -144,8 +185,17 @@ func (h *GeminiAPIHandler) GeminiHandler(c *gin.Context) {
 		})
 		return
 	}
-	action := strings.Split(strings.TrimPrefix(request.Action, "/"), ":")
-	if len(action) != 2 {
+	trimmed := strings.TrimPrefix(request.Action, "/")
+	var modelName, method string
+	if strings.HasSuffix(trimmed, "/countTokens") {
+		modelName = strings.TrimSuffix(trimmed, "/countTokens")
+		method = "countTokens"
+	} else if idx := strings.LastIndexByte(trimmed, ':'); idx != -1 {
+		modelName = trimmed[:idx]
+		method = trimmed[idx+1:]
+	}
+
+	if method == "" || modelName == "" {
 		c.JSON(http.StatusNotFound, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
 				Message: fmt.Sprintf("%s not found.", c.Request.URL.Path),
@@ -155,7 +205,6 @@ func (h *GeminiAPIHandler) GeminiHandler(c *gin.Context) {
 		return
 	}
 
-	method := action[1]
 	rawJSON, errRead := c.GetRawData()
 	if errRead != nil && c.Request != nil && c.Request.Body != nil {
 		c.JSON(clienterror.HTTPStatusFromErrorOr(errRead, http.StatusBadRequest), handlers.ErrorResponse{
@@ -167,13 +216,29 @@ func (h *GeminiAPIHandler) GeminiHandler(c *gin.Context) {
 		return
 	}
 
+	if rawModel, ok := magpie.StripMagpiePrefix(modelName); ok {
+		proxyURL := ""
+		if cfg := h.CurrentConfig(); cfg != nil {
+			proxyURL = cfg.ProxyURL
+		}
+		magpie.ForwardGeminiRequest(c.Writer, c.Request, rawModel, method, rawJSON, proxyURL, c.GetString("userApiKey"))
+		return
+	}
+
 	switch method {
 	case "generateContent":
-		h.handleGenerateContent(c, action[0], rawJSON)
+		h.handleGenerateContent(c, modelName, rawJSON)
 	case "streamGenerateContent":
-		h.handleStreamGenerateContent(c, action[0], rawJSON)
+		h.handleStreamGenerateContent(c, modelName, rawJSON)
 	case "countTokens":
-		h.handleCountTokens(c, action[0], rawJSON)
+		h.handleCountTokens(c, modelName, rawJSON)
+	default:
+		c.JSON(http.StatusNotFound, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("%s not found.", c.Request.URL.Path),
+				Type:    "invalid_request_error",
+			},
+		})
 	}
 }
 

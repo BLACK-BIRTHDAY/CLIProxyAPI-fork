@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -122,6 +123,7 @@ func TestControllerConfigureLocalInvalidPathReportsUnavailableError(t *testing.T
 
 func TestControllerPrioritizesHomeProviderOverLocalBoltStore(t *testing.T) {
 	resetControllerForTest(t)
+	defer func() { _ = ShutdownLocal() }()
 
 	localPath := filepath.Join(t.TempDir(), "local.db")
 	if errCfg := ConfigureLocal(true, localPath); errCfg != nil {
@@ -174,6 +176,7 @@ func TestControllerPrioritizesHomeProviderOverLocalBoltStore(t *testing.T) {
 
 func TestControllerHelpersWithLocalBoltStore(t *testing.T) {
 	resetControllerForTest(t)
+	defer func() { _ = ShutdownLocal() }()
 
 	dbPath := filepath.Join(t.TempDir(), "helpers.db")
 	if errCfg := ConfigureLocal(true, dbPath); errCfg != nil {
@@ -212,5 +215,29 @@ func TestControllerHelpersWithLocalBoltStore(t *testing.T) {
 	var afterDel payload
 	if _, foundAfterDel := KVGetJSONBestEffort(ctx, "cpa:test:json", &afterDel); foundAfterDel {
 		t.Fatalf("KVGetJSONBestEffort() found deleted key")
+	}
+}
+
+func TestControllerCloudRunFallback(t *testing.T) {
+	resetControllerForTest(t)
+	defer func() { _ = ShutdownLocal() }()
+
+	t.Setenv("K_SERVICE", "cpa-test-service")
+	// Providing a path not under /tmp/ should automatically fall back to os.TempDir()/cpa-kv.db
+	fusePath := "/data/kv.db"
+	if errCfg := ConfigureLocal(true, fusePath); errCfg != nil {
+		t.Fatalf("ConfigureLocal(true, %q) under Cloud Run failed: %v", fusePath, errCfg)
+	}
+
+	client, kvMode, errClient := CurrentKVClient()
+	if errClient != nil || !kvMode || client == nil {
+		t.Fatalf("CurrentKVClient() under Cloud Run = (%v, %v, %v), want valid client", client, kvMode, errClient)
+	}
+	boltStore, ok := client.(*BoltStore)
+	if !ok {
+		t.Fatalf("client type = %T, want *BoltStore", client)
+	}
+	if !strings.HasSuffix(boltStore.Path(), "cpa-kv.db") {
+		t.Fatalf("boltStore.Path() = %q, want ending with 'cpa-kv.db'", boltStore.Path())
 	}
 }

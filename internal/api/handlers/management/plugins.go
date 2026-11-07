@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/htmlsanitize"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/magpie"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	"gopkg.in/yaml.v3"
@@ -145,6 +146,35 @@ func (h *Handler) ListPlugins(c *gin.Context) {
 		}
 	}
 
+	if magpie.ShouldExposeBuiltinMenu() {
+		entries["magpie"] = pluginListEntry{
+			ID:               "magpie",
+			Configured:       true,
+			Registered:       true,
+			Enabled:          true,
+			EffectiveEnabled: true,
+			Logo:             magpie.LogoDataURI,
+			ConfigFields:     []pluginConfigFieldInfo{},
+			Menus: []pluginMenuInfo{
+				{
+					Path:        "/v0/resource/plugins/magpie/quota",
+					Menu:        "MAGPIE 配额",
+					Description: "Google AI Studio 账号配额与状态管理",
+				},
+				{
+					Path:        "/v0/resource/plugins/magpie/settings",
+					Menu:        "MAGPIE 设置",
+					Description: "Google AI Studio 守护进程配置与参数同步",
+				},
+			},
+			Metadata: &pluginMetadataInfo{
+				Name:    "MAGPIE (Google AI Studio)",
+				Version: magpie.MagpieStudioVersion,
+				Logo:    magpie.LogoDataURI,
+			},
+		}
+	}
+
 	ids := make([]string, 0, len(entries))
 	for id := range entries {
 		ids = append(ids, id)
@@ -153,7 +183,11 @@ func (h *Handler) ListPlugins(c *gin.Context) {
 	out := make([]pluginListEntry, 0, len(ids))
 	for _, id := range ids {
 		entry := entries[id]
-		entry.EffectiveEnabled = pluginsEnabled && entry.Enabled && entry.Registered
+		if id == "magpie" {
+			entry.EffectiveEnabled = true
+		} else {
+			entry.EffectiveEnabled = pluginsEnabled && entry.Enabled && entry.Registered
+		}
 		if entry.ConfigFields == nil {
 			entry.ConfigFields = []pluginConfigFieldInfo{}
 		}

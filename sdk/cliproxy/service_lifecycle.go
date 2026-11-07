@@ -9,6 +9,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/magpie"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
@@ -236,6 +237,11 @@ func (s *Service) Run(ctx context.Context) error {
 	s.registerModelRefreshCallback()
 	if !homeEnabled {
 		go s.runAntigravityModelRefresh(ctx)
+		proxyURL := ""
+		if cfg != nil {
+			proxyURL = cfg.ProxyURL
+		}
+		magpie.AutoStartBackground(ctx, proxyURL)
 	}
 
 	select {
@@ -401,6 +407,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 
 		helps.RetireProxyPoolPublisher(s.proxyPoolPublisher)
 		usage.StopDefault()
+		magpie.StopManagedBackend(ctx)
 	})
 	return shutdownErr
 }

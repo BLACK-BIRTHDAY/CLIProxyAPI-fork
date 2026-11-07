@@ -593,7 +593,46 @@ func main() {
 			log.Errorf("failed to get working directory: %v", err)
 			return
 		}
-		configFilePath = filepath.Join(wd, "config.yaml")
+		localConfigPath := filepath.Join(wd, "config.yaml")
+		var useProbedConfig bool
+		if _, statErr := os.Stat(localConfigPath); os.IsNotExist(statErr) {
+			probeDirs := []string{
+				os.Getenv("CPA_DATA_DIR"),
+				os.Getenv("WRITABLE_PATH"),
+				"/data",
+				"/root/.antigravity_tools",
+			}
+			for _, candidate := range probeDirs {
+				candidate = strings.TrimSpace(candidate)
+				if candidate == "" {
+					continue
+				}
+				if fi, statDirErr := os.Stat(candidate); statDirErr == nil && fi.IsDir() {
+					candidateConfig := filepath.Join(candidate, "config.yaml")
+					if _, statCfgErr := os.Stat(candidateConfig); os.IsNotExist(statCfgErr) {
+						hasBootstrapEnv := os.Getenv("PORT") != "" ||
+							os.Getenv("K_SERVICE") != "" ||
+							os.Getenv("API_KEY") != "" ||
+							os.Getenv("CPA_API_KEY") != "" ||
+							os.Getenv("WEB_PASSWORD") != "" ||
+							os.Getenv("MANAGEMENT_PASSWORD") != ""
+						if hasBootstrapEnv {
+							_ = os.MkdirAll(filepath.Join(candidate, "auths"), 0755)
+							bootstrapYAML := fmt.Sprintf("# Auto-bootstrapped minimal v8 configuration\nauth-dir: %q\n\nmanagement:\n  allow-remote: true\n\nserver:\n  kv-store:\n    path: \"/tmp/cpa-kv.db\"\n", filepath.Join(candidate, "auths"))
+							if errWrite := os.WriteFile(candidateConfig, []byte(bootstrapYAML), 0644); errWrite == nil {
+								log.Infof("[CONFIG] Auto-bootstrapped clean minimal v8 config at %s", candidateConfig)
+							}
+						}
+					}
+					configFilePath = candidateConfig
+					useProbedConfig = true
+					break
+				}
+			}
+		}
+		if !useProbedConfig {
+			configFilePath = localConfigPath
+		}
 		cfg, err = config.LoadConfigOptional(configFilePath, isCloudDeploy)
 	}
 	if err != nil {
@@ -602,6 +641,47 @@ func main() {
 	}
 	if cfg == nil {
 		cfg = &config.Config{}
+	}
+
+	// Apply runtime environment overrides
+	if portStr := strings.TrimSpace(os.Getenv("PORT")); portStr != "" {
+		if p, errParse := strconv.Atoi(portStr); errParse == nil && p > 0 {
+			cfg.Port = p
+		}
+	}
+	if os.Getenv("K_SERVICE") != "" && (cfg.Host == "127.0.0.1" || cfg.Host == "localhost") {
+		cfg.Host = ""
+	}
+
+	envAPIKey := strings.TrimSpace(os.Getenv("API_KEY"))
+	if envAPIKey == "" {
+		envAPIKey = strings.TrimSpace(os.Getenv("CPA_API_KEY"))
+	}
+	if envAPIKey != "" {
+		exampleKeys := safemode.ExampleAPIKeys(cfg.APIKeys)
+		if len(exampleKeys) > 0 {
+			exampleSet := make(map[string]struct{}, len(exampleKeys))
+			for _, k := range exampleKeys {
+				exampleSet[k] = struct{}{}
+			}
+			var cleaned []string
+			for _, k := range cfg.APIKeys {
+				if _, isEx := exampleSet[k]; !isEx {
+					cleaned = append(cleaned, k)
+				}
+			}
+			cfg.APIKeys = cleaned
+		}
+		hasEnvKey := false
+		for _, k := range cfg.APIKeys {
+			if k == envAPIKey {
+				hasEnvKey = true
+				break
+			}
+		}
+		if !hasEnvKey {
+			cfg.APIKeys = append(cfg.APIKeys, envAPIKey)
+		}
 	}
 
 	// In cloud deploy mode, check if we have a valid configuration

@@ -4,11 +4,17 @@ package management
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -71,10 +77,88 @@ type configReloadSnapshot struct {
 	generation uint64
 }
 
+const ManagementSessionCookieName = "cpa_mgmt_session"
+
+var (
+	mgmtSessionKeyOnce sync.Once
+	mgmtSessionKey     []byte
+)
+
+func getMgmtSessionKey() []byte {
+	mgmtSessionKeyOnce.Do(func() {
+		mgmtSessionKey = make([]byte, 32)
+		if _, err := rand.Read(mgmtSessionKey); err != nil {
+			h := sha256.Sum256([]byte(fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())))
+			mgmtSessionKey = h[:]
+		}
+	})
+	return mgmtSessionKey
+}
+
+func issueMgmtSessionToken() string {
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	mac := hmac.New(sha256.New, getMgmtSessionKey())
+	mac.Write([]byte(ts))
+	sig := hex.EncodeToString(mac.Sum(nil))
+	return ts + "." + sig
+}
+
+func validateMgmtSessionToken(token string) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) != 2 {
+		return false
+	}
+	tsStr := parts[0]
+	sig := parts[1]
+	ts, err := strconv.ParseInt(tsStr, 10, 64)
+	if err != nil {
+		return false
+	}
+	now := time.Now().Unix()
+	if now-ts > 7*24*3600 || ts > now+300 {
+		return false
+	}
+	mac := hmac.New(sha256.New, getMgmtSessionKey())
+	mac.Write([]byte(tsStr))
+	expectedSig := hex.EncodeToString(mac.Sum(nil))
+	return subtle.ConstantTimeCompare([]byte(sig), []byte(expectedSig)) == 1
+}
+
+func isSameOrigin(c *gin.Context) bool {
+	if sfs := c.GetHeader("Sec-Fetch-Site"); sfs == "cross-site" {
+		return false
+	}
+	if origin := c.GetHeader("Origin"); origin != "" {
+		if u, err := url.Parse(origin); err == nil {
+			if !strings.EqualFold(u.Host, c.Request.Host) {
+				return false
+			}
+		}
+	} else if referer := c.GetHeader("Referer"); referer != "" {
+		if u, err := url.Parse(referer); err == nil {
+			if !strings.EqualFold(u.Host, c.Request.Host) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // NewHandler creates a new management handler instance.
 func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Manager) *Handler {
 	envSecret, _ := os.LookupEnv("MANAGEMENT_PASSWORD")
 	envSecret = strings.TrimSpace(envSecret)
+	if envSecret == "" {
+		if wp, ok := os.LookupEnv("WEB_PASSWORD"); ok && strings.TrimSpace(wp) != "" {
+			envSecret = strings.TrimSpace(wp)
+		} else if os.Getenv("K_SERVICE") != "" {
+			if ak, ok := os.LookupEnv("API_KEY"); ok && strings.TrimSpace(ak) != "" {
+				envSecret = strings.TrimSpace(ak)
+			} else if cak, ok := os.LookupEnv("CPA_API_KEY"); ok && strings.TrimSpace(cak) != "" {
+				envSecret = strings.TrimSpace(cak)
+			}
+		}
+	}
 
 	h := &Handler{
 		cfg:                 cfg.CloneForRuntime(),
@@ -343,6 +427,52 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		}
 		if provided == "" {
 			provided = c.GetHeader("X-Management-Key")
+		}
+
+		if provided != "" {
+			allowed, statusCode, errMsg := h.AuthenticateManagementKey(clientIP, localClient, provided)
+			if !allowed {
+				c.AbortWithStatusJSON(statusCode, gin.H{"error": errMsg})
+				return
+			}
+			sessionToken := issueMgmtSessionToken()
+			isSecure := c.Request != nil && (c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https")
+			c.SetSameSite(http.SameSiteLaxMode)
+			c.SetCookie(ManagementSessionCookieName, sessionToken, 86400*7, "/", "", isSecure, true)
+			c.Next()
+			return
+		}
+
+		// Try session cookie authentication if no key header was provided
+		if cookieVal, err := c.Cookie(ManagementSessionCookieName); err == nil && cookieVal != "" {
+			if validateMgmtSessionToken(cookieVal) {
+				// Reject cross-site mutating requests
+				if c.Request != nil {
+					switch c.Request.Method {
+					case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+						if !isSameOrigin(c) {
+							c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "cross-site request forbidden"})
+							return
+						}
+					}
+				}
+				// Verify remote management permission
+				h.mu.Lock()
+				allowRemote := false
+				if h.cfg != nil {
+					allowRemote = h.cfg.RemoteManagement.AllowRemote
+				}
+				h.mu.Unlock()
+				if h.allowRemoteOverride {
+					allowRemote = true
+				}
+				if !localClient && !allowRemote {
+					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "remote management disabled"})
+					return
+				}
+				c.Next()
+				return
+			}
 		}
 
 		allowed, statusCode, errMsg := h.AuthenticateManagementKey(clientIP, localClient, provided)

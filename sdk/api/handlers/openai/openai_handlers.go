@@ -21,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	. "github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/magpie"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	responsesconverter "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/openai/openai/responses"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
@@ -103,6 +104,19 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 		filteredModels[i] = filteredModel
 	}
 
+	proxyURL := ""
+	if cfg := h.CurrentConfig(); cfg != nil {
+		proxyURL = cfg.ProxyURL
+	}
+	reqCtx := context.Background()
+	if c.Request != nil && c.Request.Context() != nil {
+		reqCtx = c.Request.Context()
+	}
+	magpieModels := magpie.FetchMagpieModels(reqCtx, proxyURL)
+	for _, m := range magpieModels {
+		filteredModels = append(filteredModels, magpie.ToOpenAIModelMap(m))
+	}
+
 	h.WriteModelListResponse(c, h.HandlerType(), gin.H{
 		"object": "list",
 		"data":   filteredModels,
@@ -128,6 +142,16 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 		return
 	}
 
+	model := ojson.GetBytesNoCopy(rawJSON, "model").String()
+	if rawModel, ok := magpie.StripMagpiePrefix(model); ok {
+		proxyURL := ""
+		if cfg := h.CurrentConfig(); cfg != nil {
+			proxyURL = cfg.ProxyURL
+		}
+		magpie.ForwardOpenAIChatRequest(c.Writer, c.Request, rawModel, rawJSON, proxyURL, c.GetString("userApiKey"))
+		return
+	}
+
 	// Check if the client requested a streaming response.
 	streamResult := ojson.GetBytesNoCopy(rawJSON, "stream")
 	stream := streamResult.Type == ojson.True
@@ -138,6 +162,15 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 		modelName := strings.Clone(ojson.GetBytesNoCopy(rawJSON, "model").String())
 		rawJSON, _ = responsesconverter.ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName, rawJSON, stream)
 		stream = ojson.GetBytesNoCopy(rawJSON, "stream").Bool()
+		modelAfter := ojson.GetBytesNoCopy(rawJSON, "model").String()
+		if rawModel, ok := magpie.StripMagpiePrefix(modelAfter); ok {
+			proxyURL := ""
+			if cfg := h.CurrentConfig(); cfg != nil {
+				proxyURL = cfg.ProxyURL
+			}
+			magpie.ForwardOpenAIChatRequest(c.Writer, c.Request, rawModel, rawJSON, proxyURL, c.GetString("userApiKey"))
+			return
+		}
 	}
 
 	if stream {

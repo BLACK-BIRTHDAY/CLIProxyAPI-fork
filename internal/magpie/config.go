@@ -76,6 +76,43 @@ func (c *MagpieConfig) NormalizeWorkerLimits() (warmLimit, maxActive, warmStartu
 	return c.WarmWorkerLimit, c.MaxActiveWorkers, c.WarmStartupConcurrency
 }
 
+// ShouldExposeBuiltinMenu reports whether the built-in MAGPIE plugin entry should be listed in ListPlugins.
+// It is active when pre-installed in the container (/app/magpie/aistudio2api) or explicitly enabled via MAGPIE_BUILTIN_MENU=1.
+func ShouldExposeBuiltinMenu() bool {
+	if PreinstalledBinaryPath() != "" {
+		return true
+	}
+	if os.Getenv("MAGPIE_BUILTIN_MENU") == "1" {
+		return true
+	}
+	return false
+}
+
+// IsInstalledOrConfigured reports whether the managed MAGPIE backend is pre-installed,
+// running, configured on disk, or requested via environment variables.
+func IsInstalledOrConfigured() bool {
+	if PreinstalledBinaryPath() != "" {
+		return true
+	}
+	if os.Getenv("MAGPIE_BUILTIN_MENU") == "1" || os.Getenv("K_SERVICE") != "" {
+		return true
+	}
+	dataDir := ResolveDataDir("")
+	if ResolveExecutablePath(dataDir) != "" {
+		return true
+	}
+	if HasImportedAccounts(dataDir) {
+		return true
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "magpie-gateway.json")); err == nil {
+		return true
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "config.json")); err == nil {
+		return true
+	}
+	return false
+}
+
 // ResolveDataDir resolves the root data directory for the managed MAGPIE backend.
 // It checks explicitDir, AI_STUDIO_DATA_DIR, CPA_DATA_DIR, WRITABLE_PATH,
 // /data, /root/.antigravity_tools, and falls back to ~/.local/share/magpie-ai-studio.
