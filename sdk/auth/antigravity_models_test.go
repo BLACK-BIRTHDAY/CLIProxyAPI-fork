@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 )
 
 func TestNormalizeAntigravityModelID(t *testing.T) {
@@ -245,4 +247,44 @@ func TestFetchAntigravityAvailableModels(t *testing.T) {
 			t.Fatalf("expected transient error for 302 without redirect, got %v", status)
 		}
 	})
+}
+
+func TestFetchAntigravityAvailableModelsTransportHTTP11NoALPN(t *testing.T) {
+	var capturedProto string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedProto = r.Proto
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"models":{}}`))
+	}))
+	defer server.Close()
+
+	hints, status := FetchAntigravityAvailableModels(context.Background(), AntigravityModelProbeRequest{
+		BaseURLs:    []string{server.URL},
+		AccessToken: "test-token",
+		ProjectID:   "test-project",
+	})
+	if status != AntigravityProbeStatusSuccess {
+		t.Fatalf("expected success, got %v", status)
+	}
+	if hints.ModelIDs == nil {
+		t.Fatalf("expected non-nil ModelIDs")
+	}
+	if capturedProto != "HTTP/1.1" {
+		t.Errorf("expected protocol HTTP/1.1, got %q", capturedProto)
+	}
+
+	tr := misc.CloneTransportWithHTTP11(nil)
+	if tr == nil {
+		t.Fatalf("CloneTransportWithHTTP11(nil) returned nil")
+	}
+	if tr.ForceAttemptHTTP2 {
+		t.Errorf("ForceAttemptHTTP2 = true, want false")
+	}
+	if tr.TLSNextProto == nil || len(tr.TLSNextProto) != 0 {
+		t.Errorf("TLSNextProto is not an empty map: %v", tr.TLSNextProto)
+	}
+	if tr.TLSClientConfig == nil || tr.TLSClientConfig.NextProtos != nil {
+		t.Errorf("TLSClientConfig.NextProtos = %v, want nil", tr.TLSClientConfig.NextProtos)
+	}
 }

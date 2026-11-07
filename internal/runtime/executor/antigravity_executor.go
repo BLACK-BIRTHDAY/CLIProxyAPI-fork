@@ -65,18 +65,23 @@ func NewAntigravityExecutor(cfg *config.Config) *AntigravityExecutor {
 }
 
 func (e *AntigravityExecutor) obfuscateSensitiveWords(payload []byte) []byte {
-	if e == nil || e.cfg == nil || len(e.cfg.Antigravity.SensitiveWords) == 0 {
-		return payload
+	var configuredWords []string
+	if e != nil && e.cfg != nil {
+		configuredWords = e.cfg.Antigravity.SensitiveWords
 	}
-	matcher := helps.BuildSensitiveWordMatcher(e.cfg.Antigravity.SensitiveWords)
+	matcher := helps.BuildAntigravitySensitiveWordMatcher(configuredWords)
 	return helps.ObfuscateSensitiveWordsInSystemInstruction(payload, matcher)
 }
 
 func (e *AntigravityExecutor) obfuscateSensitiveWordsDoc(doc *ojson.Doc) bool {
-	if doc == nil || e == nil || e.cfg == nil || len(e.cfg.Antigravity.SensitiveWords) == 0 {
+	if doc == nil || doc.Len() == 0 {
 		return false
 	}
-	matcher := helps.BuildSensitiveWordMatcher(e.cfg.Antigravity.SensitiveWords)
+	var configuredWords []string
+	if e != nil && e.cfg != nil {
+		configuredWords = e.cfg.Antigravity.SensitiveWords
+	}
+	matcher := helps.BuildAntigravitySensitiveWordMatcher(configuredWords)
 	return helps.ObfuscateSensitiveWordsInSystemInstructionDoc(doc, matcher)
 }
 

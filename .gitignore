@@ -31,10 +31,18 @@ auths/*
 # Documentation
 docs/*
 !docs/management-api-v8.md
+!docs/adr/
+!docs/adr/*.md
 AGENTS.md
 CLAUDE.md
 GEMINI.md
 AGENTS.override.md
+
+# Local scripts and scratch artifacts
+.scratch/
+graphify-out/
+*.cmd
+*.vbs
 
 # Tooling metadata
 .vscode/*

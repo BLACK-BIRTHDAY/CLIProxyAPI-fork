@@ -61,10 +61,22 @@ func NewAntigravityAuth(cfg *config.Config, httpClient *http.Client) *Antigravit
 		cfg = &config.Config{}
 	}
 	if httpClient != nil {
-		return &AntigravityAuth{httpClient: httpClient}
+		clientCopy := *httpClient
+		if t, ok := clientCopy.Transport.(*http.Transport); ok {
+			clientCopy.Transport = misc.CloneTransportWithHTTP11(t)
+		} else if clientCopy.Transport == nil {
+			clientCopy.Transport = misc.CloneTransportWithHTTP11(nil)
+		}
+		return &AntigravityAuth{httpClient: &clientCopy}
+	}
+	client := util.SetProxy(&cfg.SDKConfig, &http.Client{})
+	if t, ok := client.Transport.(*http.Transport); ok {
+		client.Transport = misc.CloneTransportWithHTTP11(t)
+	} else if client.Transport == nil {
+		client.Transport = misc.CloneTransportWithHTTP11(nil)
 	}
 	return &AntigravityAuth{
-		httpClient: util.SetProxy(&cfg.SDKConfig, &http.Client{}),
+		httpClient: client,
 	}
 }
 

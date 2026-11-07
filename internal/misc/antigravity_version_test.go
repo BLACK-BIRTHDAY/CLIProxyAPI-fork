@@ -67,10 +67,11 @@ func TestAntigravityUserAgentUsesHubFamily(t *testing.T) {
 		version string
 		want    string
 	}{
-		{"2.23.0", "antigravity/hub/2.23.0 (aidev_client; os_type=darwin; arch=arm64; cl=998057262)"},
-		{"2.24.0", "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64; cl=1000335682)"},
-		{"2.29.0", "antigravity/hub/2.29.0 (aidev_client; os_type=darwin; arch=arm64; cl=1013060670)"},
-		{"2.30.0", "antigravity/hub/2.30.0 (aidev_client; os_type=darwin; arch=arm64)"},
+		{"2.23.0", "antigravity/hub/2.23.0 (aidev_client; os_type=windows; arch=amd64; cl=998057262)"},
+		{"2.24.0", "antigravity/hub/2.24.0 (aidev_client; os_type=windows; arch=amd64; cl=1000335682)"},
+		{"2.28.0", "antigravity/hub/2.28.0 (aidev_client; os_type=windows; arch=amd64; cl=1008300195)"},
+		{"2.29.0", "antigravity/hub/2.29.0 (aidev_client; os_type=windows; arch=amd64; cl=1013060670)"},
+		{"2.30.0", "antigravity/hub/2.30.0 (aidev_client; os_type=windows; arch=amd64)"},
 	} {
 		t.Run(tc.version, func(t *testing.T) {
 			restore := overrideAntigravityVersionCacheForTest(t, tc.version, time.Now().Add(time.Hour))
@@ -90,12 +91,12 @@ func TestAntigravityFallbackVersionHasMatchingChangelist(t *testing.T) {
 
 func TestAntigravityVersionFromUserAgentParsesHubFamily(t *testing.T) {
 	for _, userAgent := range []string{
-		"antigravity/hub/2.24.0 darwin/arm64",
-		"antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64; cl=1000335682)",
-		"antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64; cl=1000335682) google-api-nodejs-client/10.3.0",
+		"antigravity/hub/2.28.0 windows/amd64",
+		"antigravity/hub/2.28.0 (aidev_client; os_type=windows; arch=amd64; cl=1008300195)",
+		"antigravity/hub/2.28.0 (aidev_client; os_type=windows; arch=amd64; cl=1008300195) google-api-nodejs-client/10.3.0",
 	} {
-		if got := AntigravityVersionFromUserAgent(userAgent); got != "2.24.0" {
-			t.Fatalf("AntigravityVersionFromUserAgent(%q) = %q, want %q", userAgent, got, "2.24.0")
+		if got := AntigravityVersionFromUserAgent(userAgent); got != "2.28.0" {
+			t.Fatalf("AntigravityVersionFromUserAgent(%q) = %q, want %q", userAgent, got, "2.28.0")
 		}
 	}
 }
@@ -107,10 +108,10 @@ func TestAntigravityVersionFromUserAgentParsesLegacyFamily(t *testing.T) {
 }
 
 func TestAntigravityLoadCodeAssistUserAgentUsesShortUA(t *testing.T) {
-	restore := overrideAntigravityVersionCacheForTest(t, "2.2.1", time.Now().Add(time.Hour))
+	restore := overrideAntigravityVersionCacheForTest(t, "2.28.0", time.Now().Add(time.Hour))
 	defer restore()
 
-	want := "antigravity/hub/2.2.1 (aidev_client; os_type=darwin; arch=arm64)"
+	want := "antigravity/hub/2.28.0 (aidev_client; os_type=windows; arch=amd64; cl=1008300195)"
 	if got := AntigravityLoadCodeAssistUserAgent(""); got != want {
 		t.Fatalf("AntigravityLoadCodeAssistUserAgent() = %q, want %q", got, want)
 	}
@@ -120,10 +121,10 @@ func TestAntigravityLoadCodeAssistUserAgentUsesShortUA(t *testing.T) {
 }
 
 func TestAntigravityOnboardUserUserAgentUsesLongUA(t *testing.T) {
-	restore := overrideAntigravityVersionCacheForTest(t, "2.2.1", time.Now().Add(time.Hour))
+	restore := overrideAntigravityVersionCacheForTest(t, "2.28.0", time.Now().Add(time.Hour))
 	defer restore()
 
-	want := "antigravity/hub/2.2.1 (aidev_client; os_type=darwin; arch=arm64) google-api-nodejs-client/10.3.0"
+	want := "antigravity/hub/2.28.0 (aidev_client; os_type=windows; arch=amd64; cl=1008300195) google-api-nodejs-client/10.3.0"
 	if got := AntigravityOnboardUserUserAgent(""); got != want {
 		t.Fatalf("AntigravityOnboardUserUserAgent() = %q, want %q", got, want)
 	}
@@ -171,5 +172,60 @@ func TestFetchAntigravityLatestVersionReturnsHubManifestError(t *testing.T) {
 	_, errFetch := fetchAntigravityLatestVersion(context.Background())
 	if errFetch == nil {
 		t.Fatal("fetchAntigravityLatestVersion() error = nil, want error")
+	}
+}
+
+type dummyRoundTripper struct{}
+
+func (d *dummyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func TestCloneTransportWithHTTP11(t *testing.T) {
+	// 1. With standard transport
+	cloned := CloneTransportWithHTTP11(nil)
+	if cloned == nil {
+		t.Fatal("CloneTransportWithHTTP11(nil) returned nil with default transport")
+	}
+	if cloned.ForceAttemptHTTP2 {
+		t.Error("ForceAttemptHTTP2 should be false")
+	}
+	if cloned.TLSNextProto == nil || len(cloned.TLSNextProto) != 0 {
+		t.Error("TLSNextProto should be non-nil empty map")
+	}
+	if cloned.TLSClientConfig == nil || cloned.TLSClientConfig.NextProtos != nil {
+		t.Error("TLSClientConfig.NextProtos should be nil")
+	}
+
+	// 2. When DefaultTransport is replaced by non-*http.Transport
+	oldDef := http.DefaultTransport
+	defer func() { http.DefaultTransport = oldDef }()
+	http.DefaultTransport = &dummyRoundTripper{}
+	if custom := CloneTransportWithHTTP11(nil); custom != nil {
+		t.Errorf("expected nil when http.DefaultTransport is not *http.Transport, got %v", custom)
+	}
+}
+
+func TestAntigravityBackgroundProbesDisabled(t *testing.T) {
+	tests := []struct {
+		envVal string
+		want   bool
+	}{
+		{"", false},
+		{"0", false},
+		{"false", false},
+		{"random", false},
+		{"1", true},
+		{"true", true},
+		{"TRUE", true},
+		{" True ", true},
+	}
+	for _, tc := range tests {
+		t.Run("env="+tc.envVal, func(t *testing.T) {
+			t.Setenv("ANTIGRAVITY_DISABLE_BACKGROUND_PROBES", tc.envVal)
+			if got := AntigravityBackgroundProbesDisabled(); got != tc.want {
+				t.Errorf("AntigravityBackgroundProbesDisabled() for %q = %v, want %v", tc.envVal, got, tc.want)
+			}
+		})
 	}
 }

@@ -3,10 +3,12 @@ package misc
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -20,8 +22,10 @@ const (
 	// manifest has not been fetched yet or cannot be reached. Cloud Code rejects
 	// newer models for clients below 2.23.0, so this floor must stay at or above
 	// that version.
-	antigravityFallbackVersion = "2.29.0"
-	antigravityHubPlatform     = "os_type=darwin; arch=arm64"
+	// Matched pair captured from local Windows x64 Antigravity client:
+	// version = "2.28.0", cl = "1008300195", os_type=windows; arch=amd64
+	antigravityFallbackVersion = "2.28.0"
+	antigravityHubPlatform     = "os_type=windows; arch=amd64"
 	antigravityVersionCacheTTL = 6 * time.Hour
 	antigravityFetchTimeout    = 10 * time.Second
 	AntigravityNodeAPIClientUA = "google-api-nodejs-client/10.3.0"
@@ -29,16 +33,17 @@ const (
 )
 
 var (
-	antigravityHubLatestManifestURL = "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml"
+	antigravityHubLatestManifestURL = "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest.yml"
 )
 
 // Changelists belong to specific Hub releases, not to the latest manifest in
-// general. Update the fallback release and its entry together. The 2.24.0 value
-// was verified in the official darwin-arm archive's webm_encoder build metadata.
-// Unknown releases keep their online version without claiming another build's CL.
+// general. Update the fallback release and its entry together.
+// Only versions with a verified matching changelist may be used by the background updater
+// so that an unverified remote version never emits a bare or mismatched UA.
 var antigravityHubChangelists = map[string]string{
 	"2.23.0": "998057262",
 	"2.24.0": "1000335682",
+	"2.28.0": "1008300195",
 	"2.29.0": "1013060670",
 }
 
@@ -91,7 +96,7 @@ func refreshAntigravityVersion(ctx context.Context) {
 
 	now := time.Now()
 
-	if errFetch == nil {
+	if errFetch == nil && antigravityHubChangelists[version] != "" {
 		cachedAntigravityVersion = version
 		antigravityVersionExpiry = now.Add(antigravityVersionCacheTTL)
 		log.WithField("version", version).Info("fetched latest antigravity version")
@@ -282,4 +287,39 @@ func isValidAntigravitySemVersion(version string) bool {
 	}
 
 	return true
+}
+
+// CloneTransportWithHTTP11 clones the base HTTP transport (or http.DefaultTransport
+// if base is nil) and configures it for strict HTTP/1.1 usage without ALPN or HTTP/2 upgrades.
+// If base is nil and http.DefaultTransport is not a *http.Transport (e.g. replaced by custom test RoundTripper),
+// it returns nil so callers preserve their custom transport.
+func CloneTransportWithHTTP11(base *http.Transport) *http.Transport {
+	if base == nil {
+		defTransport, ok := http.DefaultTransport.(*http.Transport)
+		if !ok || defTransport == nil {
+			return nil
+		}
+		base = defTransport
+	}
+	clone := base.Clone()
+	clone.ForceAttemptHTTP2 = false
+	// Wipe TLSNextProto to prevent implicit HTTP/2 upgrade.
+	clone.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
+	if clone.TLSClientConfig == nil {
+		clone.TLSClientConfig = &tls.Config{}
+	} else {
+		clone.TLSClientConfig = clone.TLSClientConfig.Clone()
+	}
+	// Native Antigravity sends no ALPN extension. With HTTP/2 disabled above,
+	// an empty NextProtos keeps the wire shape aligned while using HTTP/1.1.
+	clone.TLSClientConfig.NextProtos = nil
+	return clone
+}
+
+// AntigravityBackgroundProbesDisabled reports whether background probes such as
+// loadCodeAssist (credits refresh) and fetchAvailableModels (model discovery)
+// are disabled via the ANTIGRAVITY_DISABLE_BACKGROUND_PROBES environment variable.
+func AntigravityBackgroundProbesDisabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("ANTIGRAVITY_DISABLE_BACKGROUND_PROBES")))
+	return v == "1" || v == "true"
 }

@@ -24,6 +24,8 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
+const serviceScopedSuspensionCooldown = 24 * time.Hour
+
 var quotaCooldownDisabled atomic.Bool
 
 var transientErrorCooldownSeconds atomic.Int64
@@ -907,6 +909,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	cooldownStateChanged := false
 	scheduleUnauthorizedRefresh := false
 	now := time.Now()
+	if _, isSusp := isServiceScopedSuspensionResultError(result.Error); isSusp {
+		result.CredentialScope = true
+	}
 	// A 401 condemns the access token, except one a -and-cooldown rule matched: that only cools the credential.
 	rejectsToken := !result.Success && (result.Error == nil || result.Error.Code != ErrorCodeForceCooldown) && !shouldSkipCredentialCooldown(result.Error) && (statusCodeFromResult(result.Error) == http.StatusUnauthorized || isUnauthorizedError(result.Error))
 
@@ -1098,6 +1103,38 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						}
 						state.NextRetryAfter = next
 						state.Unavailable = !next.IsZero()
+					} else if reason, ok := isServiceScopedSuspensionResultError(result.Error); ok {
+						result.CredentialScope = true
+						state.StatusMessage = reason
+						if !wasTerminalUnauthorized {
+							auth.StatusMessage = reason
+						}
+						var next time.Time
+						if !disableCooling {
+							next = now.Add(serviceScopedSuspensionCooldown)
+						}
+						state.NextRetryAfter = next
+						state.Unavailable = !next.IsZero()
+						if !disableCooling {
+							for _, otherState := range auth.ModelStates {
+								if otherState != nil && otherState != state {
+									otherState.Unavailable = true
+									otherState.Status = StatusError
+									otherState.StatusMessage = reason
+									if otherState.NextRetryAfter.Before(next) {
+										otherState.NextRetryAfter = next
+									}
+								}
+							}
+							if !wasTerminalUnauthorized {
+								auth.Unavailable = true
+								auth.Status = StatusError
+								auth.StatusMessage = reason
+								if auth.NextRetryAfter.Before(next) {
+									auth.NextRetryAfter = next
+								}
+							}
+						}
 					} else {
 						switch statusCode {
 						case 401, 402, 403:
@@ -1893,6 +1930,13 @@ func isAuthActiveCooldown(auth *Auth, now time.Time) bool {
 	return false
 }
 
+// IsNonQuotaAuthCooling reports whether an auth has an active non-quota cooldown
+// (such as tos_violation, validation_required, unauthorized, or payment_required)
+// while allowing 429 quota-cooled accounts to still probe topped-up Google One AI credits.
+func IsNonQuotaAuthCooling(auth *Auth, now time.Time) bool {
+	return auth != nil && auth.Unavailable && !auth.Quota.Exceeded && auth.NextRetryAfter.After(now)
+}
+
 func cloneError(err *Error) *Error {
 	if err == nil {
 		return nil
@@ -2651,6 +2695,27 @@ func isCreditBalanceTooLowResultError(err *Error) bool {
 	return false
 }
 
+func isServiceScopedSuspensionResultError(err *Error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	status := statusCodeFromResult(err)
+	if status != 0 && status != http.StatusForbidden {
+		return "", false
+	}
+	combined := strings.ToLower(err.Code + " " + err.Message)
+	if strings.Contains(combined, "tos_violation") ||
+		strings.Contains(combined, "violation of terms of service") ||
+		strings.Contains(combined, "this service has been disabled in this account") {
+		return "tos_violation", true
+	}
+	if strings.Contains(combined, "validation_required") ||
+		strings.Contains(combined, "verify your account to continue") {
+		return "validation_required", true
+	}
+	return "", false
+}
+
 func isModelSupportResultError(err *Error) bool {
 	if err == nil {
 		return false
@@ -3117,6 +3182,23 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.NextRetryAfter = time.Time{}
 		} else {
 			auth.NextRetryAfter = now.Add(30 * time.Minute)
+		}
+	} else if reason, ok := isServiceScopedSuspensionResultError(resultErr); ok {
+		auth.StatusMessage = reason
+		if disableCooling {
+			auth.NextRetryAfter = time.Time{}
+		} else {
+			auth.NextRetryAfter = now.Add(serviceScopedSuspensionCooldown)
+			for _, state := range auth.ModelStates {
+				if state != nil {
+					state.Unavailable = true
+					state.Status = StatusError
+					state.StatusMessage = reason
+					if state.NextRetryAfter.Before(auth.NextRetryAfter) {
+						state.NextRetryAfter = auth.NextRetryAfter
+					}
+				}
+			}
 		}
 	} else {
 		switch statusCode {

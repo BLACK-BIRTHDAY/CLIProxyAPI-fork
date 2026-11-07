@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"math/rand/v2"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +29,15 @@ const (
 	antigravityCapabilityRetryMax    = 30 * time.Minute
 	antigravityRefreshScanInterval   = time.Minute
 )
+
+func antigravityEffectiveCapabilityCacheTTL() time.Duration {
+	if val := strings.TrimSpace(os.Getenv("ANTIGRAVITY_PROBE_INTERVAL")); val != "" {
+		if d, err := time.ParseDuration(val); err == nil && d > 0 {
+			return d
+		}
+	}
+	return antigravityCapabilityCacheTTL
+}
 
 type antigravityProbeStatus = sdkauth.AntigravityProbeStatus
 
@@ -58,7 +68,7 @@ type antigravityFailureState struct {
 }
 
 func nextAntigravityFailure(previous antigravityFailureState, now time.Time, randomInt64N func(int64) int64) antigravityFailureState {
-	if now.Sub(previous.lastFailure) > 2*antigravityCapabilityCacheTTL {
+	if now.Sub(previous.lastFailure) > 2*antigravityEffectiveCapabilityCacheTTL() {
 		previous.failures = 0
 	}
 	// Five failures reach the capped window: 2, 4, 8, 16, 30 minutes.
@@ -317,18 +327,18 @@ func (s *Service) fetchAntigravityModelCapabilityHints(ctx context.Context, auth
 		}
 		now := antigravityNowFunc()
 		for key, other := range antigravityCapabilityCache {
-			if key != cacheKey && !other.pending && now.Sub(other.lastUsed) > 2*antigravityCapabilityCacheTTL {
+			if key != cacheKey && !other.pending && now.Sub(other.lastUsed) > 2*antigravityEffectiveCapabilityCacheTTL() {
 				delete(antigravityCapabilityCache, key)
 			}
 		}
 		for key, failure := range antigravityAuthFailureCache {
-			if now.Sub(failure.lastFailure) > 2*antigravityCapabilityCacheTTL {
+			if now.Sub(failure.lastFailure) > 2*antigravityEffectiveCapabilityCacheTTL() {
 				delete(antigravityAuthFailureCache, key)
 			}
 		}
 		if status == antigravityProbeStatusSuccess && hints.ModelIDs != nil {
 			hints.revision = revision
-			current.hints, current.expiresAt, current.lastUsed = hints.clone(), now.Add(antigravityCapabilityCacheTTL), now
+			current.hints, current.expiresAt, current.lastUsed = hints.clone(), now.Add(antigravityEffectiveCapabilityCacheTTL()), now
 			antigravityCapabilityCache[cacheKey] = current
 			delete(antigravityAuthFailureCache, failureKey)
 			return hints, nil
@@ -603,7 +613,7 @@ func (s *Service) applyAntigravityModelHints(ctx context.Context, auth *coreauth
 // One unfinished request must not block other accounts' retry or expiry deadlines.
 // Network concurrency remains bounded by antigravityProbeSlots.
 func (s *Service) refreshAntigravityModels(ctx context.Context) {
-	if s == nil || s.coreManager == nil || s.antigravityHomeEnabled() {
+	if s == nil || s.coreManager == nil || s.antigravityHomeEnabled() || misc.AntigravityBackgroundProbesDisabled() {
 		return
 	}
 	if ctx == nil {
@@ -617,6 +627,9 @@ func (s *Service) refreshAntigravityModels(ctx context.Context) {
 			return
 		}
 		if auth == nil || auth.Disabled || !strings.EqualFold(auth.Provider, "antigravity") {
+			continue
+		}
+		if coreauth.IsNonQuotaAuthCooling(auth, antigravityNowFunc()) {
 			continue
 		}
 		snapshot := auth.Clone()

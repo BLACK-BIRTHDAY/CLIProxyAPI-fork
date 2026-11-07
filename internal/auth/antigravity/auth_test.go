@@ -170,3 +170,41 @@ func jsonResponse(body string) *http.Response {
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}
 }
+
+func TestNewAntigravityAuthTransportHTTP11NoALPN(t *testing.T) {
+	auth := NewAntigravityAuth(nil, nil)
+	if auth == nil || auth.httpClient == nil {
+		t.Fatal("expected non-nil auth and httpClient")
+	}
+	tr, ok := auth.httpClient.Transport.(*http.Transport)
+	if !ok || tr == nil {
+		t.Fatalf("expected *http.Transport, got %T", auth.httpClient.Transport)
+	}
+	if tr.ForceAttemptHTTP2 {
+		t.Errorf("ForceAttemptHTTP2 = true, want false")
+	}
+	if tr.TLSNextProto == nil || len(tr.TLSNextProto) != 0 {
+		t.Errorf("TLSNextProto is not an empty map: %v", tr.TLSNextProto)
+	}
+	if tr.TLSClientConfig == nil || tr.TLSClientConfig.NextProtos != nil {
+		t.Errorf("TLSClientConfig.NextProtos = %v, want nil", tr.TLSClientConfig.NextProtos)
+	}
+}
+
+func TestNewAntigravityAuthCustomClientTransportHTTP11NoALPN(t *testing.T) {
+	customTr := &http.Transport{ForceAttemptHTTP2: true}
+	auth := NewAntigravityAuth(nil, &http.Client{Transport: customTr})
+	tr, ok := auth.httpClient.Transport.(*http.Transport)
+	if !ok || tr == nil {
+		t.Fatalf("expected *http.Transport, got %T", auth.httpClient.Transport)
+	}
+	if tr.ForceAttemptHTTP2 {
+		t.Errorf("ForceAttemptHTTP2 = true, want false")
+	}
+	if tr.TLSNextProto == nil || len(tr.TLSNextProto) != 0 {
+		t.Errorf("TLSNextProto is not an empty map: %v", tr.TLSNextProto)
+	}
+	if tr.TLSClientConfig == nil || tr.TLSClientConfig.NextProtos != nil {
+		t.Errorf("TLSClientConfig.NextProtos = %v, want nil", tr.TLSClientConfig.NextProtos)
+	}
+}

@@ -806,7 +806,7 @@ func generateStableSessionIDFromContents(contents ojson.Result) string {
 		if text == "" {
 			return true
 		}
-		hash := sha256.Sum256([]byte(text))
+		hash := sha256.Sum256([]byte(helps.InstallationSalt() + ":" + text))
 		value := int64(binary.BigEndian.Uint64(hash[:8])) & 0x7FFFFFFFFFFFFFFF
 		stableID = "-" + strconv.FormatInt(value, 10)
 		return false

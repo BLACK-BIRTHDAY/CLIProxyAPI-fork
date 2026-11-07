@@ -35,3 +35,44 @@ _Avoid_: Remote model info, probed model specs
 **Explicit Model Whitelist**:
 The list of models explicitly declared under a credential's `models` configuration, which restricts that credential to serving only the declared models unless excluded individually.
 _Avoid_: Custom model list, configured model override
+
+### Antigravity Upstream Evasion and Resilience
+
+**Client Wire Fingerprint**:
+The combination of HTTP protocol version, TLS ALPN negotiation state, and `User-Agent` metadata tuple (version, platform, and Piper changelist) that identifies an outbound request as originating from the official Antigravity client binary.
+_Avoid_: Spoofed UA, browser fingerprint, client header profile
+
+**System Instruction Cloaking**:
+The selective transformation of third-party agent harness declarations and brand identifiers inside outbound system instructions—via zero-width character insertion or canonical identity substitution—without mutating user conversation messages or tool schemas.
+_Avoid_: Prompt sanitization, global word filtering, payload scrubbing
+
+**Service-Scoped Suspension**:
+An upstream `403 PERMISSION_DENIED` rejection (`TOS_VIOLATION` or `VALIDATION_REQUIRED`) that disables Cloud Code inference for a specific OAuth credential until manual user appeal or verification, while leaving the underlying Google account and subscription intact.
+_Avoid_: Account ban, quota exhaustion, transient 403
+
+**Failover Contagion**:
+The cascading flagging of multiple OAuth credentials in a pool caused by replaying a rejected request across sibling accounts in rapid succession without backoff jitter.
+_Avoid_: Retry storm, credential cascade, pool poisoning
+
+### MAGPIE Integration
+
+**MAGPIE Backend**:
+The managed Google AI Studio upstream service paired with the gateway to execute inference across pooled Google AI Studio accounts.
+_Avoid_: Studio plugin, inner proxy, web backend
+
+**MAGPIE Model**:
+Any model served by the MAGPIE Backend and exposed on the unified gateway under the `(MAGPIE)/` namespace for both Client Model ID and Display Name so downstream clients group it separately while preserving native Gemini capability detection.
+_Avoid_: Studio model, prefixed model
+
+**Account State Bundle**:
+A portable snapshot of MAGPIE Google account session states, browser fingerprints, model catalogs, and WAA interpreters transferred from a desktop login environment into a headless cloud deployment.
+_Avoid_: Cookie dump, auth archive, raw storage state
+
+**Bidirectional Tool Name Alias**:
+A deterministic per-request mapping between a downstream client tool identifier exceeding Google AI Studio's length limit and a collision-free shortened upstream identifier, applied outbound across declarations and conversation history and reversed inbound on responses.
+_Avoid_: One-way tool truncation, global tool registry
+
+**Malformed Empty Upstream Reply**:
+An upstream completion response that terminates with a malformed-generation finish reason without emitting any visible text or tool calls, which the gateway intercepts before streaming to the client and silently retries.
+_Avoid_: Empty stream bug, continuation prompt
+

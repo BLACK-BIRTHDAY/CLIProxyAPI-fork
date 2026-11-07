@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/MoeForge/moego/ojson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 )
@@ -90,9 +91,9 @@ func FetchAntigravityAvailableModels(ctx context.Context, req AntigravityModelPr
 	if errProxy != nil {
 		return AntigravityModelCapabilityHints{}, AntigravityProbeStatusTransientError
 	}
-	if transport != nil {
-		client.Transport = transport
-		defer transport.CloseIdleConnections()
+	if http11Transport := misc.CloneTransportWithHTTP11(transport); http11Transport != nil {
+		client.Transport = http11Transport
+		defer http11Transport.CloseIdleConnections()
 	}
 
 	doc := ojson.NewDoc([]byte("{}"))

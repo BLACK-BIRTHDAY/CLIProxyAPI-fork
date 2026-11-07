@@ -67,3 +67,35 @@ func TestDerivedSessionProviderMappingsRequireIdentity(t *testing.T) {
 		t.Fatalf("DerivedAntigravitySessionID() = %q, want empty", got)
 	}
 }
+
+func TestInstallationSaltEnvOverride(t *testing.T) {
+	const defaultSalt = "agy-win64:877f8cb6-6be4-41df-ac52-9bfb796f16fc:c8ae5f08-31c2-5519-b3e1-48dcc1ac8bcd"
+	t.Setenv("ANTIGRAVITY_INSTALLATION_SALT", "")
+	if got := InstallationSalt(); got != defaultSalt {
+		t.Errorf("InstallationSalt() = %q, want default %q", got, defaultSalt)
+	}
+
+	metadata := map[string]any{cliproxyexecutor.DerivedSessionIDMetadataKey: "ctx:v1:test-root"}
+	defaultAgyDec := DerivedAntigravitySessionID(metadata)
+	defaultAgyUUID := DerivedSessionUUID("antigravity", metadata)
+	defaultCodexUUID := DerivedSessionUUID("codex", metadata)
+
+	t.Setenv("ANTIGRAVITY_INSTALLATION_SALT", "  custom-salt-123  ")
+	if got := InstallationSalt(); got != "custom-salt-123" {
+		t.Errorf("InstallationSalt() = %q, want %q", got, "custom-salt-123")
+	}
+
+	customAgyDec := DerivedAntigravitySessionID(metadata)
+	customAgyUUID := DerivedSessionUUID("antigravity", metadata)
+	customCodexUUID := DerivedSessionUUID("codex", metadata)
+
+	if customAgyDec == defaultAgyDec {
+		t.Errorf("DerivedAntigravitySessionID() should change with ANTIGRAVITY_INSTALLATION_SALT: %q", customAgyDec)
+	}
+	if customAgyUUID == defaultAgyUUID {
+		t.Errorf("DerivedSessionUUID(antigravity) should change with ANTIGRAVITY_INSTALLATION_SALT: %q", customAgyUUID)
+	}
+	if customCodexUUID != defaultCodexUUID {
+		t.Errorf("DerivedSessionUUID(codex) should NOT change with ANTIGRAVITY_INSTALLATION_SALT: got %q, want %q", customCodexUUID, defaultCodexUUID)
+	}
+}

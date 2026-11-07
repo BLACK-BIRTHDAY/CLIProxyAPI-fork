@@ -16,6 +16,7 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	homekv "github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -364,8 +365,12 @@ func newAntigravityStatusErr(statusCode int, body []byte) statusErr {
 	}
 	return err
 }
+
 func (e *AntigravityExecutor) maybeRefreshAntigravityCreditsHint(ctx context.Context, auth *cliproxyauth.Auth, accessToken string) {
 	if e == nil || auth == nil || !antigravityCreditsRetryEnabled(e.cfg) || antigravityCoolingDisabled(auth, e.cfg) {
+		return
+	}
+	if misc.AntigravityBackgroundProbesDisabled() || cliproxyauth.IsNonQuotaAuthCooling(auth, time.Now()) {
 		return
 	}
 	if ctx != nil && ctx.Err() != nil {

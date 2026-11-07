@@ -1176,8 +1176,12 @@ oauth:
       #   beta-features: "multi_agent"
 
     # Antigravity provider behavior.
+    # Multi-instance environment variables (e.g. Local Windows + Google Cloud Run sharing OAuth credentials):
+    # - ANTIGRAVITY_INSTALLATION_SALT: override the private session ID salt across instances
+    # - ANTIGRAVITY_DISABLE_BACKGROUND_PROBES=true: disable periodic fetchAvailableModels / loadCodeAssist probes on secondary instances
+    # - ANTIGRAVITY_PROBE_INTERVAL=6h: override model capability probe interval
     antigravity:
-      # sensitive-words:              # optional: words to obfuscate with zero-width characters in system instructions
+      # sensitive-words:              # optional: additional words to obfuscate with zero-width characters in system instructions (merged with built-in agent harness defaults)
       #   - "API"
       #   - "proxy"
       # connection-pool:              # optional: upstream HTTP connection pool settings

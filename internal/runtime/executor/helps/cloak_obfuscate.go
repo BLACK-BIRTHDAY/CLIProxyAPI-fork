@@ -12,9 +12,51 @@ import (
 // zeroWidthSpace is the Unicode zero-width space character used for obfuscation.
 const zeroWidthSpace = "\u200B"
 
+// DefaultAntigravitySensitiveWords contains the built-in sensitive terms obfuscated
+// in Antigravity system instructions.
+var DefaultAntigravitySensitiveWords = []string{
+	"Claude Agent SDK",
+	"Claude Code",
+	"Anthropic",
+	"OpenClaw",
+	"OpenCode",
+	"Cherry Studio",
+	"Eta",
+	"Roo Code",
+	"Cline",
+	"Cursor",
+	"system-conventions",
+	"system_conventions",
+	"system-directive",
+	"system_directive",
+	"RFC 2119",
+}
+
+const (
+	// ClaudeAgentSDKIdentitySentence is the high-risk Claude Agent SDK subagent identity statement.
+	ClaudeAgentSDKIdentitySentence = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+
+	// AntigravityCanonicalIdentitySentence is the canonical Antigravity identity replacement.
+	AntigravityCanonicalIdentitySentence = "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding."
+)
+
+var (
+	// ClaudeAgentSDKIdentityPattern matches the Claude Agent SDK identity sentence case-insensitively.
+	ClaudeAgentSDKIdentityPattern = regexp.MustCompile(`(?i)` + regexp.QuoteMeta(ClaudeAgentSDKIdentitySentence))
+)
+
 // SensitiveWordMatcher holds the compiled regex for matching sensitive words.
 type SensitiveWordMatcher struct {
 	regex *regexp.Regexp
+}
+
+// BuildAntigravitySensitiveWordMatcher combines DefaultAntigravitySensitiveWords with
+// configuredWords and compiles a SensitiveWordMatcher.
+func BuildAntigravitySensitiveWordMatcher(configuredWords []string) *SensitiveWordMatcher {
+	combined := make([]string, 0, len(DefaultAntigravitySensitiveWords)+len(configuredWords))
+	combined = append(combined, DefaultAntigravitySensitiveWords...)
+	combined = append(combined, configuredWords...)
+	return BuildSensitiveWordMatcher(combined)
 }
 
 // BuildSensitiveWordMatcher compiles a regex from the word list.
@@ -121,7 +163,7 @@ func ObfuscateSensitiveWordsDoc(doc *ojson.Doc, matcher *SensitiveWordMatcher) b
 
 // ObfuscateSensitiveWordsInSystemInstruction obfuscates sensitive words in an Antigravity system instruction.
 func ObfuscateSensitiveWordsInSystemInstruction(payload []byte, matcher *SensitiveWordMatcher) []byte {
-	if matcher == nil || matcher.regex == nil || len(payload) == 0 {
+	if len(payload) == 0 {
 		return payload
 	}
 	doc := ojson.NewDoc(payload)
@@ -133,7 +175,7 @@ func ObfuscateSensitiveWordsInSystemInstruction(payload []byte, matcher *Sensiti
 
 // ObfuscateSensitiveWordsInSystemInstructionDoc obfuscates sensitive words in an Antigravity system instruction in place on doc.
 func ObfuscateSensitiveWordsInSystemInstructionDoc(doc *ojson.Doc, matcher *SensitiveWordMatcher) bool {
-	if matcher == nil || matcher.regex == nil || doc == nil || doc.Len() == 0 {
+	if doc == nil || doc.Len() == 0 {
 		return false
 	}
 
@@ -145,8 +187,9 @@ func ObfuscateSensitiveWordsInSystemInstructionDoc(doc *ojson.Doc, matcher *Sens
 		}
 		if instruction.Type == ojson.String {
 			text := instruction.String()
-			if obfuscated := matcher.obfuscateText(text); obfuscated != text {
-				if errSet := doc.Set(path, obfuscated); errSet == nil {
+			transformed := transformSystemInstructionText(text, matcher)
+			if transformed != text {
+				if errSet := doc.Set(path, transformed); errSet == nil {
 					modified = true
 				}
 			}
@@ -154,24 +197,52 @@ func ObfuscateSensitiveWordsInSystemInstructionDoc(doc *ojson.Doc, matcher *Sens
 		}
 
 		parts := instruction.Get("parts")
-		if !parts.IsArray() {
+		if parts.IsArray() {
+			parts.ForEach(func(key, part ojson.Result) bool {
+				if part.Get("text").Type != ojson.String {
+					return true
+				}
+				text := part.Get("text").String()
+				transformed := transformSystemInstructionText(text, matcher)
+				if transformed != text {
+					if errSet := doc.Set(path+".parts."+key.String()+".text", transformed); errSet == nil {
+						modified = true
+					}
+				}
+				return true
+			})
 			continue
 		}
-		parts.ForEach(func(key, part ojson.Result) bool {
-			if part.Get("text").Type != ojson.String {
-				return true
-			}
-			text := part.Get("text").String()
-			if obfuscated := matcher.obfuscateText(text); obfuscated != text {
-				if errSet := doc.Set(path+".parts."+key.String()+".text", obfuscated); errSet == nil {
-					modified = true
+
+		if instruction.IsArray() {
+			instruction.ForEach(func(key, part ojson.Result) bool {
+				if part.Get("text").Type != ojson.String {
+					return true
 				}
-			}
-			return true
-		})
+				text := part.Get("text").String()
+				transformed := transformSystemInstructionText(text, matcher)
+				if transformed != text {
+					if errSet := doc.Set(path+"."+key.String()+".text", transformed); errSet == nil {
+						modified = true
+					}
+				}
+				return true
+			})
+		}
 	}
 
 	return modified
+}
+
+func transformSystemInstructionText(text string, matcher *SensitiveWordMatcher) string {
+	if text == "" {
+		return text
+	}
+	replaced := ClaudeAgentSDKIdentityPattern.ReplaceAllLiteralString(text, AntigravityCanonicalIdentitySentence)
+	if matcher != nil {
+		replaced = matcher.obfuscateText(replaced)
+	}
+	return replaced
 }
 
 func obfuscateSystemBlocksDoc(doc *ojson.Doc, matcher *SensitiveWordMatcher) bool {

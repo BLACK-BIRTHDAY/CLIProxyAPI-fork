@@ -3,6 +3,7 @@ package helps
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"os"
 	"strconv"
 	"strings"
 
@@ -36,13 +37,32 @@ func ProviderSessionUUID(provider string, metadataSets ...map[string]any) string
 	return DerivedSessionUUID(provider, metadataSets...)
 }
 
+const (
+	// Private per-installation salt derived from this host's real Antigravity installation UUID
+	// (server.go:1786 = 877f8cb6-6be4-41df-ac52-9bfb796f16fc / .updaterId = c8ae5f08-31c2-5519-b3e1-48dcc1ac8bcd)
+	// so session IDs never collide with public CLIProxyAPI / ccextra / Antigravity-Manager cohorts.
+	privateInstallationSalt = "agy-win64:877f8cb6-6be4-41df-ac52-9bfb796f16fc:c8ae5f08-31c2-5519-b3e1-48dcc1ac8bcd"
+)
+
+// InstallationSalt returns the per-installation salt, using ANTIGRAVITY_INSTALLATION_SALT env var if set.
+func InstallationSalt() string {
+	if salt := strings.TrimSpace(os.Getenv("ANTIGRAVITY_INSTALLATION_SALT")); salt != "" {
+		return salt
+	}
+	return privateInstallationSalt
+}
+
 func stableProviderSessionUUID(provider string, kind string, identityValue string) string {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	identityValue = strings.TrimSpace(identityValue)
 	if provider == "" || identityValue == "" {
 		return ""
 	}
-	identity := strings.Join([]string{"cli-proxy-api", provider, kind, identityValue}, "\x00")
+	namespace := "cli-proxy-api"
+	if provider == "antigravity" {
+		namespace = InstallationSalt()
+	}
+	identity := strings.Join([]string{namespace, provider, kind, identityValue}, "\x00")
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(identity)).String()
 }
 
@@ -52,7 +72,7 @@ func DerivedAntigravitySessionID(metadataSets ...map[string]any) string {
 	if derivedID == "" {
 		return ""
 	}
-	sum := sha256.Sum256([]byte("cli-proxy-api:antigravity:derived-session\x00" + derivedID))
+	sum := sha256.Sum256([]byte(InstallationSalt() + ":antigravity:session\x00" + derivedID))
 	value := int64(binary.BigEndian.Uint64(sum[:8])) & 0x7FFFFFFFFFFFFFFF
 	return "-" + strconv.FormatInt(value, 10)
 }

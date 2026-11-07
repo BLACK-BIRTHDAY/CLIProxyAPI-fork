@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math/rand/v2"
 	"net/http"
 	"path/filepath"
 	"sort"
@@ -59,6 +60,56 @@ func (e *upstreamExecutionAttemptError) Unwrap() error {
 		return nil
 	}
 	return e.cause
+}
+
+var (
+	antigravityFailoverMinJitter = 800 * time.Millisecond
+	antigravityFailoverMaxJitter = 2000 * time.Millisecond
+	failoverContagionJitterFunc  = defaultAntigravityFailoverJitterWait
+)
+
+func defaultAntigravityFailoverJitterWait(ctx context.Context, provider string, err error) error {
+	if !strings.EqualFold(strings.TrimSpace(provider), "antigravity") || statusCodeFromError(err) != http.StatusForbidden {
+		return nil
+	}
+	if ctx != nil {
+		if errCtx := ctx.Err(); errCtx != nil {
+			return errCtx
+		}
+	}
+	minJitter := antigravityFailoverMinJitter
+	maxJitter := antigravityFailoverMaxJitter
+	var jitter time.Duration
+	if maxJitter <= minJitter {
+		jitter = minJitter
+	} else {
+		delta := maxJitter - minJitter
+		jitter = minJitter + rand.N(delta)
+	}
+	if jitter <= 0 {
+		return nil
+	}
+	if ctx == nil {
+		time.Sleep(jitter)
+		return nil
+	}
+	timer := time.NewTimer(jitter)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func waitFailoverContagionJitter(ctx context.Context, attemptedCount int, provider string, err error) error {
+	if attemptedCount > 0 && strings.EqualFold(strings.TrimSpace(provider), "antigravity") && statusCodeFromError(err) == http.StatusForbidden {
+		if failoverContagionJitterFunc != nil {
+			return failoverContagionJitterFunc(ctx, provider, err)
+		}
+	}
+	return nil
 }
 
 func markUpstreamExecutionAttempt(err error) error {
@@ -718,6 +769,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if homeMode {
 					homeAuthCount++
 				}
+				if errJitter := waitFailoverContagionJitter(ctx, len(attempted), provider, authErr); errJitter != nil {
+					return cliproxyexecutor.Response{}, errJitter
+				}
 				continue
 			}
 			if isResponsesCompactRequestFaultError(opts, authErr) || isRequestInvalidError(authErr) {
@@ -726,6 +780,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			lastErr = authErr
 			if homeMode {
 				homeAuthCount++
+			}
+			if errJitter := waitFailoverContagionJitter(ctx, len(attempted), provider, authErr); errJitter != nil {
+				return cliproxyexecutor.Response{}, errJitter
 			}
 			continue
 		}
@@ -1265,6 +1322,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				if homeMode {
 					homeAuthCount++
 				}
+				if errJitter := waitFailoverContagionJitter(ctx, len(attempted), provider, errStream); errJitter != nil {
+					return nil, errJitter
+				}
 				continue
 			}
 			if isRequestInvalidError(errStream) || cliproxyexecutor.IsUpstreamWebsocketTurnError(errStream) {
@@ -1276,6 +1336,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			if homeMode {
 				homeAuthCount++
+			}
+			if errJitter := waitFailoverContagionJitter(ctx, len(attempted), provider, errStream); errJitter != nil {
+				return nil, errJitter
 			}
 			continue
 		}
