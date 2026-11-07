@@ -914,6 +914,51 @@ const quotaPageHTML = `<!DOCTYPE html>
       document.body.removeChild(ta);
     }
 
+    // Storage Deobfuscation & Key Resolution
+    function deobfuscateCpaStorage(raw) {
+      if (!raw || typeof raw !== 'string') return '';
+      var isV2 = raw.indexOf('enc::v2::') === 0;
+      var isV1 = raw.indexOf('enc::v1::') === 0;
+      if (!isV2 && !isV1) return raw;
+      try {
+        var b64 = raw.slice(9);
+        var binStr = atob(b64);
+        var bytes = new Uint8Array(binStr.length);
+        for (var i = 0; i < binStr.length; i++) bytes[i] = binStr.charCodeAt(i);
+        var host = (window.location && window.location.host) ? window.location.host : '';
+        var secret = 'cli-proxy-api-webui::secure-storage' + (host ? ('|' + host + (isV1 ? ('|' + navigator.userAgent) : '')) : '');
+        var keyBytes = new TextEncoder().encode(secret);
+        var out = new Uint8Array(bytes.length);
+        for (var j = 0; j < bytes.length; j++) out[j] = bytes[j] ^ keyBytes[j % keyBytes.length];
+        return new TextDecoder().decode(out);
+      } catch (e) {
+        return '';
+      }
+    }
+    function resolveStoredManagementKey() {
+      try {
+        var direct = localStorage.getItem('magpie-mgmt-key') || sessionStorage.getItem('magpie-mgmt-key');
+        if (direct && direct.trim()) return direct.trim();
+      } catch (e) {}
+      try {
+        var raw = localStorage.getItem('cli-proxy-auth') || sessionStorage.getItem('cli-proxy-auth');
+        if (!raw) return '';
+        var decoded = deobfuscateCpaStorage(raw);
+        if (!decoded) return '';
+        try {
+          var parsed = JSON.parse(decoded);
+          if (parsed && typeof parsed === 'object') {
+            var k = (parsed.state && parsed.state.managementKey) || parsed.managementKey || '';
+            return (typeof k === 'string') ? k.trim() : '';
+          }
+        } catch (e2) {
+          if (raw.indexOf('enc::') === 0) return '';
+          return decoded.trim();
+        }
+      } catch (e) {}
+      return '';
+    }
+
     // API fetcher
     function fetchApi(endpoint, options) {
       options = options || {};
@@ -922,7 +967,7 @@ const quotaPageHTML = `<!DOCTYPE html>
       }, options.headers || {});
 
       try {
-        var key = localStorage.getItem('cli-proxy-auth') || sessionStorage.getItem('cli-proxy-auth');
+        var key = resolveStoredManagementKey();
         if (key && !headers['Authorization']) {
           headers['Authorization'] = 'Bearer ' + key;
           headers['X-Management-Key'] = key;
@@ -971,7 +1016,7 @@ const quotaPageHTML = `<!DOCTYPE html>
       var val = input.value.trim();
       if (!val) return;
       try {
-        localStorage.setItem('cli-proxy-auth', val);
+        localStorage.setItem('magpie-mgmt-key', val);
       } catch (e) {}
       closeAuthModal();
       showToast('管理密钥已保存，正在重试请求...', 'info');
@@ -2549,6 +2594,51 @@ const settingsPageHTML = `<!DOCTYPE html>
       if (urlEl && origin) urlEl.textContent = origin;
     } catch (e) {}
 
+    // Storage Deobfuscation & Key Resolution
+    function deobfuscateCpaStorage(raw) {
+      if (!raw || typeof raw !== 'string') return '';
+      var isV2 = raw.indexOf('enc::v2::') === 0;
+      var isV1 = raw.indexOf('enc::v1::') === 0;
+      if (!isV2 && !isV1) return raw;
+      try {
+        var b64 = raw.slice(9);
+        var binStr = atob(b64);
+        var bytes = new Uint8Array(binStr.length);
+        for (var i = 0; i < binStr.length; i++) bytes[i] = binStr.charCodeAt(i);
+        var host = (window.location && window.location.host) ? window.location.host : '';
+        var secret = 'cli-proxy-api-webui::secure-storage' + (host ? ('|' + host + (isV1 ? ('|' + navigator.userAgent) : '')) : '');
+        var keyBytes = new TextEncoder().encode(secret);
+        var out = new Uint8Array(bytes.length);
+        for (var j = 0; j < bytes.length; j++) out[j] = bytes[j] ^ keyBytes[j % keyBytes.length];
+        return new TextDecoder().decode(out);
+      } catch (e) {
+        return '';
+      }
+    }
+    function resolveStoredManagementKey() {
+      try {
+        var direct = localStorage.getItem('magpie-mgmt-key') || sessionStorage.getItem('magpie-mgmt-key');
+        if (direct && direct.trim()) return direct.trim();
+      } catch (e) {}
+      try {
+        var raw = localStorage.getItem('cli-proxy-auth') || sessionStorage.getItem('cli-proxy-auth');
+        if (!raw) return '';
+        var decoded = deobfuscateCpaStorage(raw);
+        if (!decoded) return '';
+        try {
+          var parsed = JSON.parse(decoded);
+          if (parsed && typeof parsed === 'object') {
+            var k = (parsed.state && parsed.state.managementKey) || parsed.managementKey || '';
+            return (typeof k === 'string') ? k.trim() : '';
+          }
+        } catch (e2) {
+          if (raw.indexOf('enc::') === 0) return '';
+          return decoded.trim();
+        }
+      } catch (e) {}
+      return '';
+    }
+
     // API fetcher
     var pendingAuthRetry = null;
     function fetchApi(endpoint, options) {
@@ -2558,7 +2648,7 @@ const settingsPageHTML = `<!DOCTYPE html>
       }, options.headers || {});
 
       try {
-        var key = localStorage.getItem('cli-proxy-auth') || sessionStorage.getItem('cli-proxy-auth');
+        var key = resolveStoredManagementKey();
         if (key && !headers['Authorization']) {
           headers['Authorization'] = 'Bearer ' + key;
           headers['X-Management-Key'] = key;
@@ -2607,7 +2697,7 @@ const settingsPageHTML = `<!DOCTYPE html>
       var val = input.value.trim();
       if (!val) return;
       try {
-        localStorage.setItem('cli-proxy-auth', val);
+        localStorage.setItem('magpie-mgmt-key', val);
       } catch (e) {}
       closeAuthModal();
       showToast('管理密钥已保存，正在重试请求...', 'info');

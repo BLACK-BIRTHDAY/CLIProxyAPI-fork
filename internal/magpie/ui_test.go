@@ -93,6 +93,19 @@ func TestQuotaPageHTML(t *testing.T) {
 		}
 	}
 
+	// Validate management auth deobfuscation and fallback tokens
+	authTokens := []string{
+		"resolveStoredManagementKey",
+		"deobfuscateCpaStorage",
+		"cli-proxy-api-webui::secure-storage",
+		"magpie-mgmt-key",
+	}
+	for _, tok := range authTokens {
+		if !strings.Contains(html, tok) {
+			t.Errorf("QuotaPageHTML missing auth token %q", tok)
+		}
+	}
+
 	// Ensure zero dead desktop-only endpoints exist
 	forbiddenTokens := []string{
 		"login_magpie_account",
@@ -203,6 +216,19 @@ func TestSettingsPageHTML(t *testing.T) {
 		}
 	}
 
+	// Validate management auth deobfuscation and fallback tokens
+	authTokens := []string{
+		"resolveStoredManagementKey",
+		"deobfuscateCpaStorage",
+		"cli-proxy-api-webui::secure-storage",
+		"magpie-mgmt-key",
+	}
+	for _, tok := range authTokens {
+		if !strings.Contains(html, tok) {
+			t.Errorf("SettingsPageHTML missing auth token %q", tok)
+		}
+	}
+
 	// Ensure zero dead desktop-only endpoints exist
 	forbiddenTokens := []string{
 		"login_magpie_account",
@@ -236,6 +262,29 @@ func TestNoExternalCDNDependencies(t *testing.T) {
 		for _, cdn := range externalCDNs {
 			if strings.Contains(html, cdn) {
 				t.Errorf("%s contains external CDN dependency %q (violating offline/strict CSP rule)", pageName, cdn)
+			}
+		}
+	}
+}
+
+func TestAuthDeobfuscationTokens(t *testing.T) {
+	pages := map[string][]byte{
+		"QuotaPage":    QuotaPageHTML(),
+		"SettingsPage": SettingsPageHTML(),
+	}
+
+	requiredTokens := []string{
+		"resolveStoredManagementKey",
+		"deobfuscateCpaStorage",
+		"cli-proxy-api-webui::secure-storage",
+		"magpie-mgmt-key",
+	}
+
+	for pageName, bytes := range pages {
+		html := string(bytes)
+		for _, tok := range requiredTokens {
+			if !strings.Contains(html, tok) {
+				t.Errorf("%s missing required auth deobfuscation token %q", pageName, tok)
 			}
 		}
 	}

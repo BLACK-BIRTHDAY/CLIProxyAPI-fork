@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/magpie"
 	"gopkg.in/yaml.v3"
 )
 
@@ -25,6 +26,12 @@ const ConfigV8ContextKey = "management.config-v8"
 // detect that another writer saved after its read (412) instead of silently
 // overwriting the change. Without If-Match, writes stay unconditional.
 func (h *Handler) ConfigV8(c *gin.Context) {
+	path := strings.Trim(c.Param("path"), "/")
+	if path == "plugins/configs/magpie" || path == "plugins/configs/magpie/enabled" {
+		h.handleMagpieConfigV8(c, path)
+		return
+	}
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	raw, err := os.ReadFile(h.configFilePath)
@@ -49,7 +56,6 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 		return
 	}
 	root := doc.Content[0]
-	path := strings.Trim(c.Param("path"), "/")
 	parts := []string{}
 	if path != "" {
 		parts = strings.Split(path, "/")
@@ -376,4 +382,90 @@ func mergeConfigV8Patch(dst, src *yaml.Node) {
 			dst.Content = append(dst.Content, key, value)
 		}
 	}
+}
+
+func (h *Handler) handleMagpieConfigV8(c *gin.Context, path string) {
+	dataDir := magpie.ResolveDataDir("")
+	proxyURL := h.effectiveProxyURL()
+	cfg, err := magpie.LoadGatewayConfig(dataDir, proxyURL)
+	if err != nil {
+		cfg = magpie.NewDefaultConfig()
+	}
+
+	if path == "plugins/configs/magpie/enabled" {
+		switch c.Request.Method {
+		case http.MethodGet:
+			c.Header("Cache-Control", "no-store")
+			c.JSON(http.StatusOK, cfg.Enabled)
+			return
+		case http.MethodPut, http.MethodPatch:
+			body, errRead := io.ReadAll(c.Request.Body)
+			if errRead != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body"})
+				return
+			}
+			var enabledVal bool
+			if errUnmarshal := json.Unmarshal(body, &enabledVal); errUnmarshal != nil {
+				var obj struct {
+					Enabled *bool `json:"enabled"`
+				}
+				if errObj := json.Unmarshal(body, &obj); errObj == nil && obj.Enabled != nil {
+					enabledVal = *obj.Enabled
+				} else {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": "expected boolean or object with enabled"})
+					return
+				}
+			}
+			cfg.Enabled = enabledVal
+			h.saveAndApplyMagpieConfig(c, dataDir, cfg, proxyURL)
+			return
+		default:
+			c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "method_not_allowed"})
+			return
+		}
+	}
+
+	if path == "plugins/configs/magpie" {
+		switch c.Request.Method {
+		case http.MethodGet:
+			data, errMarshal := json.Marshal(cfg)
+			if errMarshal != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "encode_failed", "message": errMarshal.Error()})
+				return
+			}
+			var m map[string]any
+			if errUnmarshal := json.Unmarshal(data, &m); errUnmarshal != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "encode_failed", "message": errUnmarshal.Error()})
+				return
+			}
+			if m == nil {
+				m = make(map[string]any)
+			}
+			m["priority"] = 0
+			c.Header("Cache-Control", "no-store")
+			c.JSON(http.StatusOK, m)
+			return
+		case http.MethodPut, http.MethodPatch:
+			body, errRead := io.ReadAll(c.Request.Body)
+			if errRead != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body"})
+				return
+			}
+			if !json.Valid(body) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_json"})
+				return
+			}
+			if errUnmarshal := json.Unmarshal(body, cfg); errUnmarshal != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": errUnmarshal.Error()})
+				return
+			}
+			h.saveAndApplyMagpieConfig(c, dataDir, cfg, proxyURL)
+			return
+		default:
+			c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "method_not_allowed"})
+			return
+		}
+	}
+
+	c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
 }

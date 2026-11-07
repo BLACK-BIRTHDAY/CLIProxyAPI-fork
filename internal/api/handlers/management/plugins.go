@@ -1,6 +1,7 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -147,14 +148,21 @@ func (h *Handler) ListPlugins(c *gin.Context) {
 	}
 
 	if magpie.ShouldExposeBuiltinMenu() {
+		fields := magpiePluginConfigFields()
+		magpieCfg, _ := magpie.LoadGatewayConfig(magpie.ResolveDataDir(""), h.effectiveProxyURL())
+		magpieEnabled := true
+		if magpieCfg != nil {
+			magpieEnabled = magpieCfg.Enabled
+		}
+		pluginsEnabled = true
 		entries["magpie"] = pluginListEntry{
 			ID:               "magpie",
 			Configured:       true,
 			Registered:       true,
-			Enabled:          true,
-			EffectiveEnabled: true,
+			Enabled:          magpieEnabled,
+			EffectiveEnabled: magpieEnabled,
 			Logo:             magpie.LogoDataURI,
-			ConfigFields:     []pluginConfigFieldInfo{},
+			ConfigFields:     fields,
 			Menus: []pluginMenuInfo{
 				{
 					Path:        "/v0/resource/plugins/magpie/quota",
@@ -168,9 +176,10 @@ func (h *Handler) ListPlugins(c *gin.Context) {
 				},
 			},
 			Metadata: &pluginMetadataInfo{
-				Name:    "MAGPIE (Google AI Studio)",
-				Version: magpie.MagpieStudioVersion,
-				Logo:    magpie.LogoDataURI,
+				Name:         "MAGPIE (Google AI Studio)",
+				Version:      magpie.MagpieStudioVersion,
+				Logo:         magpie.LogoDataURI,
+				ConfigFields: fields,
 			},
 		}
 	}
@@ -184,7 +193,7 @@ func (h *Handler) ListPlugins(c *gin.Context) {
 	for _, id := range ids {
 		entry := entries[id]
 		if id == "magpie" {
-			entry.EffectiveEnabled = true
+			entry.EffectiveEnabled = entry.Enabled
 		} else {
 			entry.EffectiveEnabled = pluginsEnabled && entry.Enabled && entry.Registered
 		}
@@ -208,6 +217,30 @@ func (h *Handler) ListPlugins(c *gin.Context) {
 func (h *Handler) GetPluginConfig(c *gin.Context) {
 	id, okID := pluginIDFromRequest(c)
 	if !okID {
+		return
+	}
+	if id == "magpie" {
+		dataDir := magpie.ResolveDataDir("")
+		proxyURL := h.effectiveProxyURL()
+		cfg, err := magpie.LoadGatewayConfig(dataDir, proxyURL)
+		if err != nil {
+			cfg = magpie.NewDefaultConfig()
+		}
+		data, errMarshal := json.Marshal(cfg)
+		if errMarshal != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin_config_encode_failed", "message": errMarshal.Error()})
+			return
+		}
+		var m map[string]any
+		if errUnmarshal := json.Unmarshal(data, &m); errUnmarshal != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin_config_encode_failed", "message": errUnmarshal.Error()})
+			return
+		}
+		if m == nil {
+			m = make(map[string]any)
+		}
+		m["priority"] = 0
+		c.JSON(http.StatusOK, m)
 		return
 	}
 	if h == nil {
@@ -271,6 +304,17 @@ func (h *Handler) PatchPluginEnabled(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": "enabled is required"})
 		return
 	}
+	if id == "magpie" {
+		dataDir := magpie.ResolveDataDir("")
+		proxyURL := h.effectiveProxyURL()
+		cfg, err := magpie.LoadGatewayConfig(dataDir, proxyURL)
+		if err != nil {
+			cfg = magpie.NewDefaultConfig()
+		}
+		cfg.Enabled = *body.Enabled
+		h.saveAndApplyMagpieConfig(c, dataDir, cfg, proxyURL)
+		return
+	}
 
 	h.mu.Lock()
 	ensurePluginConfigMap(h.cfg)
@@ -304,6 +348,25 @@ func (h *Handler) PutPluginConfig(c *gin.Context) {
 	if !okBody {
 		return
 	}
+	if id == "magpie" {
+		dataDir := magpie.ResolveDataDir("")
+		proxyURL := h.effectiveProxyURL()
+		cfg, err := magpie.LoadGatewayConfig(dataDir, proxyURL)
+		if err != nil {
+			cfg = magpie.NewDefaultConfig()
+		}
+		jsonBytes, errMarshal := json.Marshal(body)
+		if errMarshal != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": errMarshal.Error()})
+			return
+		}
+		if errUnmarshal := json.Unmarshal(jsonBytes, cfg); errUnmarshal != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": errUnmarshal.Error()})
+			return
+		}
+		h.saveAndApplyMagpieConfig(c, dataDir, cfg, proxyURL)
+		return
+	}
 	node, errNode := yamlNodeFromJSONObject(body)
 	if errNode != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": errNode.Error()})
@@ -330,6 +393,25 @@ func (h *Handler) PatchPluginConfig(c *gin.Context) {
 	}
 	body, okBody := readPluginConfigObject(c)
 	if !okBody {
+		return
+	}
+	if id == "magpie" {
+		dataDir := magpie.ResolveDataDir("")
+		proxyURL := h.effectiveProxyURL()
+		cfg, err := magpie.LoadGatewayConfig(dataDir, proxyURL)
+		if err != nil {
+			cfg = magpie.NewDefaultConfig()
+		}
+		jsonBytes, errMarshal := json.Marshal(body)
+		if errMarshal != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": errMarshal.Error()})
+			return
+		}
+		if errUnmarshal := json.Unmarshal(jsonBytes, cfg); errUnmarshal != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": errUnmarshal.Error()})
+			return
+		}
+		h.saveAndApplyMagpieConfig(c, dataDir, cfg, proxyURL)
 		return
 	}
 
@@ -368,6 +450,10 @@ func (h *Handler) PatchPluginConfig(c *gin.Context) {
 func (h *Handler) DeletePlugin(c *gin.Context) {
 	id, okID := pluginIDFromRequest(c)
 	if !okID {
+		return
+	}
+	if id == "magpie" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot_delete_builtin_plugin", "message": "builtin magpie plugin cannot be deleted"})
 		return
 	}
 	if h == nil {
@@ -782,4 +868,106 @@ func cloneYAMLNode(node *yaml.Node) *yaml.Node {
 		}
 	}
 	return &out
+}
+
+func magpiePluginConfigFields() []pluginConfigFieldInfo {
+	return []pluginConfigFieldInfo{
+		{
+			Name:        "auto_start",
+			Type:        "boolean",
+			Default:     true,
+			Description: "随主服务启动时自动拉起 AIStudio2API 后端",
+		},
+		{
+			Name:        "routing_strategy",
+			Type:        "enum",
+			Default:     "fill-first",
+			EnumValues:  []string{"fill-first", "round-robin"},
+			Description: "账号负载分发策略 (fill-first 占满优先 / round-robin 轮询)",
+		},
+		{
+			Name:        "per_account_concurrency",
+			Type:        "integer",
+			Default:     1,
+			Description: "单账号最大并发请求数",
+		},
+		{
+			Name:        "warm_worker_limit",
+			Type:        "integer",
+			Default:     1,
+			Description: "常驻预热 Worker 数量",
+		},
+		{
+			Name:        "max_active_workers",
+			Type:        "integer",
+			Default:     1,
+			Description: "最大活跃 Worker 上限",
+		},
+		{
+			Name:        "warm_startup_concurrency",
+			Type:        "integer",
+			Default:     1,
+			Description: "启动时预热并发数",
+		},
+		{
+			Name:        "request_timeout_ms",
+			Type:        "integer",
+			Default:     1800000,
+			Description: "上游请求超时时间 (毫秒，默认 1800000 即 30 分钟)",
+		},
+		{
+			Name:        "first_event_hedge",
+			Type:        "enum",
+			Default:     "off",
+			EnumValues:  []string{"off", "auto", "on"},
+			Description: "首事件对冲策略 (off 关闭 / auto 自动 / on 强制)",
+		},
+		{
+			Name:        "first_event_hedge_models",
+			Type:        "string",
+			Default:     "gemini-4-argon",
+			Description: "首事件对冲适用的模型匹配规则 (逗号分隔)",
+		},
+		{
+			Name:        "allow_images",
+			Type:        "boolean",
+			Default:     true,
+			Description: "允许图片输入",
+		},
+		{
+			Name:        "allow_tools",
+			Type:        "boolean",
+			Default:     true,
+			Description: "允许 Function Calling / Tools 调用",
+		},
+		{
+			Name:        "image_models",
+			Type:        "boolean",
+			Default:     true,
+			Description: "启用图像生成模型支持",
+		},
+		{
+			Name:        "proxy",
+			Type:        "string",
+			Default:     "",
+			Description: "访问 Google 的上游代理 (留空继承全局代理)",
+		},
+	}
+}
+
+func (h *Handler) saveAndApplyMagpieConfig(c *gin.Context, dataDir string, cfg *magpie.MagpieConfig, proxyURL string) {
+	if errSave := magpie.SaveGatewayConfig(dataDir, cfg); errSave != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "save_failed", "message": errSave.Error()})
+		return
+	}
+	ctx := context.Background()
+	if c.Request != nil && c.Request.Context() != nil {
+		ctx = c.Request.Context()
+	}
+	if cfg.Enabled {
+		_ = magpie.ApplyMagpieConfig(ctx, dataDir, cfg, proxyURL)
+	} else {
+		_ = magpie.StopBackend(ctx, dataDir)
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
