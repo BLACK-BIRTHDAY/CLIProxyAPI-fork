@@ -1,0 +1,433 @@
+package magpie
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+)
+
+const (
+	// MagpiePrefix is the standard canonical prefix for MAGPIE models.
+	MagpiePrefix = "(MAGPIE)/"
+	// MagpieLegacyPrefix is the legacy prefix without slash.
+	MagpieLegacyPrefix = "(MAGPIE)"
+	// MagpieFullwidthPrefix is the full-width parenthesis prefix with slash.
+	MagpieFullwidthPrefix = "（MAGPIE）/"
+	// MagpieFullwidthLegacyPrefix is the full-width parenthesis prefix without slash.
+	MagpieFullwidthLegacyPrefix = "（MAGPIE）"
+)
+
+// StripMagpiePrefix strips any variant of (MAGPIE)/, (MAGPIE), （MAGPIE）/, or （MAGPIE）
+// as well as optional leading or inner "models/" prefixes and leading slashes.
+// Returns the raw model ID and true if a MAGPIE prefix was present, or ("", false) if not.
+func StripMagpiePrefix(model string) (string, bool) {
+	s := strings.TrimLeft(model, "/")
+	s = strings.TrimPrefix(s, "models/")
+
+	var stripped string
+	var matched bool
+
+	if strings.HasPrefix(s, MagpiePrefix) {
+		stripped = strings.TrimPrefix(s, MagpiePrefix)
+		matched = true
+	} else if strings.HasPrefix(s, MagpieLegacyPrefix) {
+		stripped = strings.TrimPrefix(s, MagpieLegacyPrefix)
+		matched = true
+	} else if strings.HasPrefix(s, MagpieFullwidthPrefix) {
+		stripped = strings.TrimPrefix(s, MagpieFullwidthPrefix)
+		matched = true
+	} else if strings.HasPrefix(s, MagpieFullwidthLegacyPrefix) {
+		stripped = strings.TrimPrefix(s, MagpieFullwidthLegacyPrefix)
+		matched = true
+	}
+
+	if !matched {
+		return "", false
+	}
+
+	stripped = strings.TrimLeft(stripped, "/")
+	stripped = strings.TrimPrefix(stripped, "models/")
+	return stripped, true
+}
+
+// PrefixMagpieModel normalizes a raw model ID into the canonical "(MAGPIE)/<model>" format,
+// stripping any existing (MAGPIE) or "models/" prefixes first.
+func PrefixMagpieModel(rawModel string) string {
+	clean := strings.TrimLeft(rawModel, "/")
+	clean = strings.TrimPrefix(clean, "models/")
+	if stripped, ok := StripMagpiePrefix(clean); ok {
+		clean = stripped
+	}
+	return MagpiePrefix + clean
+}
+
+// IsMagpieModel reports whether model carries any MAGPIE namespace prefix.
+func IsMagpieModel(model string) bool {
+	_, ok := StripMagpiePrefix(model)
+	return ok
+}
+
+// MagpieModelInfo describes a filtered model supported by the MAGPIE backend.
+type MagpieModelInfo struct {
+	ID                         string   `json:"id"`
+	PrefixedID                 string   `json:"prefixed_id"`
+	DisplayName                string   `json:"display_name"`
+	Description                string   `json:"description,omitempty"`
+	InputTokenLimit            int64    `json:"input_token_limit"`
+	OutputTokenLimit           int64    `json:"output_token_limit"`
+	ThinkingLevels             []string `json:"thinking_levels,omitempty"`
+	SupportsTools              bool     `json:"supports_tools"`
+	IsImage                    bool     `json:"is_image"`
+	SupportedGenerationMethods []string `json:"supported_generation_methods,omitempty"`
+}
+
+var reExclude = regexp.MustCompile(`(?i)(?:image|nano-banana|tts|audio|live|transcribe|robotics|research|video|music|canvas)`)
+
+var nonTextCaps = []string{
+	"image_route",
+	"speech_route",
+	"live_route",
+	"aspect_ratio",
+	"output_resolution",
+	"interactions_api",
+	"transcription_output",
+}
+
+var imageCaps = map[string]bool{
+	"image_route":       true,
+	"aspect_ratio":      true,
+	"output_resolution": true,
+}
+
+// FilterStudioModels filters raw models returned by GET /v1/models from AIStudio2API.
+// It is an exact port of filter_studio_models in antigravity tools.
+func FilterStudioModels(rawModels []map[string]any, allowImageModels bool) []MagpieModelInfo {
+	result := make([]MagpieModelInfo, 0)
+	seen := make(map[string]bool)
+
+	listsChannels := false
+	for _, item := range rawModels {
+		if c, ok := item["channels"].([]any); ok && len(c) > 0 {
+			listsChannels = true
+			break
+		}
+	}
+
+	for _, item := range rawModels {
+		id, ok := item["id"].(string)
+		if !ok || id == "" || !strings.HasPrefix(id, "gemini-") {
+			continue
+		}
+		lowerID := strings.ToLower(id)
+		if strings.HasSuffix(lowerID, "-build") || strings.HasSuffix(lowerID, "-search") {
+			continue
+		}
+
+		// supported_generation_methods
+		var methods []string
+		if mArr, ok := item["supported_generation_methods"].([]any); ok {
+			for _, m := range mArr {
+				if s, ok := m.(string); ok {
+					methods = append(methods, s)
+				}
+			}
+		}
+		if len(methods) > 0 {
+			hasGenContent := false
+			for _, m := range methods {
+				if m == "generateContent" {
+					hasGenContent = true
+					break
+				}
+			}
+			if !hasGenContent {
+				continue
+			}
+		}
+
+		// capabilities
+		caps, _ := item["capabilities"].(map[string]any)
+		chatModel := true
+		if caps != nil {
+			if v, ok := caps["chat_model"].(bool); ok {
+				chatModel = v
+			}
+		}
+		assistantRoute := false
+		if caps != nil {
+			if v, ok := caps["assistant_route"].(bool); ok {
+				assistantRoute = v
+			}
+		}
+		if !chatModel || assistantRoute {
+			continue
+		}
+
+		isImage := false
+		if caps != nil {
+			if v, ok := caps["image_route"].(bool); ok {
+				isImage = v
+			}
+		}
+		if isImage {
+			if !allowImageModels {
+				continue
+			}
+		} else if reExclude.MatchString(id) {
+			continue
+		}
+
+		// Check non-text capabilities
+		if caps != nil {
+			hasDisallowedNonText := false
+			for _, capName := range nonTextCaps {
+				if isSet, ok := caps[capName].(bool); ok && isSet {
+					if !(isImage && imageCaps[capName]) {
+						hasDisallowedNonText = true
+						break
+					}
+				}
+			}
+			if hasDisallowedNonText {
+				continue
+			}
+		}
+
+		// Channels check
+		if listsChannels {
+			cArr, ok := item["channels"].([]any)
+			if !ok || len(cArr) == 0 {
+				continue
+			}
+		}
+
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+
+		parseTokenLimit := func(key string) int64 {
+			if val, ok := item[key]; ok {
+				switch v := val.(type) {
+				case float64:
+					return int64(v)
+				case int64:
+					return v
+				case int:
+					return int64(v)
+				}
+			}
+			return 0
+		}
+
+		upstreamInput := parseTokenLimit("input_token_limit")
+		var inputTokenLimit int64
+		if upstreamInput > 0 {
+			inputTokenLimit = upstreamInput
+		} else if isImage {
+			inputTokenLimit = 32768
+		} else {
+			inputTokenLimit = 1048576
+		}
+
+		upstreamOutput := parseTokenLimit("output_token_limit")
+		var outputTokenLimit int64
+		if upstreamOutput > 0 {
+			outputTokenLimit = upstreamOutput
+		} else if isImage {
+			outputTokenLimit = 8192
+		} else {
+			outputTokenLimit = 65536
+		}
+
+		displayName := id
+		if name, ok := item["name"].(string); ok && name != "" {
+			displayName = name
+		}
+		var description string
+		if desc, ok := item["description"].(string); ok {
+			description = desc
+		}
+
+		supportsTools := false
+		if caps != nil {
+			if st, ok := caps["function_declarations"].(bool); ok {
+				supportsTools = st
+			}
+		}
+
+		var thinkingLevels []string
+		if tArr, ok := item["thinking_levels"].([]any); ok {
+			for _, t := range tArr {
+				if s, ok := t.(string); ok {
+					thinkingLevels = append(thinkingLevels, s)
+				}
+			}
+		} else if caps != nil {
+			tVal, _ := caps["thinking"].(bool)
+			tlVal, _ := caps["thinking_level"].(bool)
+			if tVal || tlVal {
+				thinkingLevels = []string{"minimal", "low", "medium", "high"}
+			}
+		}
+
+		prefixedID := PrefixMagpieModel(id)
+		result = append(result, MagpieModelInfo{
+			ID:                         id,
+			PrefixedID:                 prefixedID,
+			DisplayName:                displayName,
+			Description:                description,
+			InputTokenLimit:            inputTokenLimit,
+			OutputTokenLimit:           outputTokenLimit,
+			ThinkingLevels:             thinkingLevels,
+			SupportsTools:              supportsTools,
+			IsImage:                    isImage,
+			SupportedGenerationMethods: methods,
+		})
+	}
+
+	return result
+}
+
+// FetchMagpieModels queries the active MAGPIE backend for models, caches them to
+// <data_dir>/models-cache.json on success, and falls back to cached models if the backend
+// is warming up or temporarily unreachable.
+func FetchMagpieModels(ctx context.Context, inheritedProxy string) []MagpieModelInfo {
+	if override := GetTestBackendOverride(); override != nil {
+		client := &http.Client{Timeout: 3 * time.Second}
+		req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/v1/models", override.BaseURL), nil)
+		if err == nil {
+			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", override.APIKey))
+			if res, err := client.Do(req); err == nil {
+				defer res.Body.Close()
+				if res.StatusCode == http.StatusOK {
+					var body map[string]any
+					if err := json.NewDecoder(res.Body).Decode(&body); err == nil {
+						if dataArr, ok := body["data"].([]any); ok {
+							var raw []map[string]any
+							for _, item := range dataArr {
+								if m, ok := item.(map[string]any); ok {
+									raw = append(raw, m)
+								}
+							}
+							return FilterStudioModels(raw, override.Config.ImageModels)
+						}
+					}
+				}
+			}
+		}
+		return nil
+	}
+
+	dataDir := ResolveDataDir("")
+	cfg, err := LoadGatewayConfig(dataDir, inheritedProxy)
+	if err != nil || !cfg.Enabled {
+		return nil
+	}
+
+	cachePath := filepath.Join(dataDir, "models-cache.json")
+	loadCache := func() []MagpieModelInfo {
+		if content, err := os.ReadFile(cachePath); err == nil {
+			var cached []MagpieModelInfo
+			if err := json.Unmarshal(content, &cached); err == nil {
+				return cached
+			}
+		}
+		return nil
+	}
+
+	configPath := filepath.Join(dataDir, "config.json")
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		return loadCache()
+	}
+	var studioCfg StudioConfigFile
+	if err := json.Unmarshal(content, &studioCfg); err != nil || studioCfg.Port <= 0 {
+		return loadCache()
+	}
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/v1/models", studioCfg.Port)
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return loadCache()
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", studioCfg.APIKey))
+
+	res, err := client.Do(req)
+	if err != nil || res.StatusCode != http.StatusOK {
+		if res != nil && res.Body != nil {
+			_ = res.Body.Close()
+		}
+		// If unreachable and auto_start enabled, trigger background warm-up
+		if cfg.AutoStart && HasImportedAccounts(dataDir) {
+			go func() {
+				_ = EnsureRunning(context.Background(), dataDir, cfg, inheritedProxy)
+			}()
+		}
+		return loadCache()
+	}
+	defer res.Body.Close()
+
+	bodyBytes, err := io.ReadAll(res.Body)
+	if err != nil {
+		return loadCache()
+	}
+	var body map[string]any
+	if err := json.Unmarshal(bodyBytes, &body); err != nil {
+		return loadCache()
+	}
+
+	dataArr, ok := body["data"].([]any)
+	if !ok {
+		return loadCache()
+	}
+	var rawModels []map[string]any
+	for _, item := range dataArr {
+		if m, ok := item.(map[string]any); ok {
+			rawModels = append(rawModels, m)
+		}
+	}
+
+	filtered := FilterStudioModels(rawModels, cfg.ImageModels)
+	if len(filtered) > 0 {
+		if cacheBytes, err := json.MarshalIndent(filtered, "", "  "); err == nil {
+			_ = os.WriteFile(cachePath, append(cacheBytes, '\n'), 0644)
+		}
+	}
+	return filtered
+}
+
+// ToOpenAIModelMap converts a MagpieModelInfo into an OpenAI /v1/models response entry,
+// setting owned_by="magpie" and id=prefixed_id.
+func ToOpenAIModelMap(m MagpieModelInfo) map[string]any {
+	return map[string]any{
+		"id":                 m.PrefixedID,
+		"object":             "model",
+		"created":            1700000000,
+		"owned_by":           "magpie",
+		"display_name":       m.PrefixedID,
+		"input_token_limit":  m.InputTokenLimit,
+		"output_token_limit": m.OutputTokenLimit,
+	}
+}
+
+// ToGeminiModelMap converts a MagpieModelInfo into a Gemini /v1beta/models response entry,
+// setting name="models/(MAGPIE)/..." and displayName="(MAGPIE)/...".
+func ToGeminiModelMap(m MagpieModelInfo) map[string]any {
+	return map[string]any{
+		"name":                       "models/" + m.PrefixedID,
+		"displayName":                m.PrefixedID,
+		"description":                m.Description,
+		"inputTokenLimit":            m.InputTokenLimit,
+		"outputTokenLimit":           m.OutputTokenLimit,
+		"supportedGenerationMethods": m.SupportedGenerationMethods,
+	}
+}

@@ -1,0 +1,91 @@
+name: Docker Publish
+
+on:
+  push:
+    branches:
+      - main
+      - 'feat/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker-publish:
+    name: Build & Publish Docker Image (linux/amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (ghcr.io)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub (optional)
+        env:
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "$DOCKERHUB_USER" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin
+          else
+            echo "DOCKERHUB secrets not configured, skipping Docker Hub login."
+          fi
+
+      - name: Prepare build metadata and tags
+        id: meta
+        env:
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -e
+          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          SHORT_SHA="${GITHUB_SHA::7}"
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          VERSION="${GITHUB_REF_NAME}"
+
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "tags<<EOF"
+            echo "ghcr.io/${OWNER_LOWER}/cliproxyapi:latest"
+            echo "ghcr.io/${OWNER_LOWER}/cliproxyapi:${SHORT_SHA}"
+            if [ -n "$DOCKERHUB_USER" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+              echo "docker.io/${DOCKERHUB_USER}/cliproxyapi:latest"
+              echo "docker.io/${DOCKERHUB_USER}/cliproxyapi:${SHORT_SHA}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Prepared Docker image tags:"
+          echo "ghcr.io/${OWNER_LOWER}/cliproxyapi:latest"
+          echo "ghcr.io/${OWNER_LOWER}/cliproxyapi:${SHORT_SHA}"
+          if [ -n "$DOCKERHUB_USER" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+            echo "docker.io/${DOCKERHUB_USER}/cliproxyapi:latest"
+            echo "docker.io/${DOCKERHUB_USER}/cliproxyapi:${SHORT_SHA}"
+          fi
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT=${{ steps.meta.outputs.short_sha }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
