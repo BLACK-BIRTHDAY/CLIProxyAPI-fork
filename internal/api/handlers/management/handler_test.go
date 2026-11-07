@@ -40,6 +40,33 @@ func TestAuthenticateManagementKey_LocalhostIPBan_BlocksCorrectKeyDuringBan(t *t
 	}
 }
 
+func TestAuthenticateManagementKey_MissingKey_DoesNotTriggerIPBan(t *testing.T) {
+	h := &Handler{
+		cfg: &config.Config{
+			RemoteManagement: config.RemoteManagement{
+				AllowRemote: true,
+			},
+		},
+		failedAttempts: make(map[string]*attemptInfo),
+		envSecret:      "test-secret",
+	}
+
+	for i := 0; i < 10; i++ {
+		allowed, statusCode, errMsg := h.AuthenticateManagementKey("169.254.169.126", false, "")
+		if allowed {
+			t.Fatalf("expected empty auth to be denied at attempt %d", i+1)
+		}
+		if statusCode != http.StatusUnauthorized || errMsg != "missing management key" {
+			t.Fatalf("unexpected auth failure at attempt %d: status=%d msg=%q", i+1, statusCode, errMsg)
+		}
+	}
+
+	allowed, statusCode, errMsg := h.AuthenticateManagementKey("169.254.169.126", false, "test-secret")
+	if !allowed || statusCode != 0 || errMsg != "" {
+		t.Fatalf("expected valid key to succeed after missing-key probes, got allowed=%v status=%d msg=%q", allowed, statusCode, errMsg)
+	}
+}
+
 func TestMiddlewareSetsSupportPluginHeader(t *testing.T) {
 
 	h := &Handler{

@@ -464,6 +464,9 @@ func SyncStudioEnv(dataDir string, studioCfg *StudioConfigFile, cfg *MagpieConfi
 	newContent := sb.String()
 
 	envPath := filepath.Join(dataDir, ".env")
+	tmpEnvPath := filepath.Join(ResolveRuntimeTempDir(), ".env")
+	_ = os.WriteFile(tmpEnvPath, []byte(newContent), 0600)
+
 	if existing, err := os.ReadFile(envPath); err == nil && string(existing) == newContent {
 		return nil
 	}

@@ -573,7 +573,6 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 	}
 
 	if provided == "" {
-		fail()
 		return false, http.StatusUnauthorized, "missing management key"
 	}
 

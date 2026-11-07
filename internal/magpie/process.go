@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -151,6 +152,13 @@ func StudioAdminRequest(ctx context.Context, dataDir string, method, path string
 
 	baseOrigin := fmt.Sprintf("http://127.0.0.1:%d", studioCfg.Port)
 	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: nil, // Loopback connection must bypass outbound proxy
+			DialContext: (&net.Dialer{
+				Timeout:   2500 * time.Millisecond,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+		},
 		Timeout: timeout,
 	}
 
@@ -369,6 +377,16 @@ func StartBackend(ctx context.Context, dataDir string, cfg *MagpieConfig, inheri
 	}
 
 	tmpDir := ResolveRuntimeTempDir()
+	// Mirror .env into tmpDir because AIStudio2API reads .env from its working directory,
+	// and running with cmd.Dir = tmpDir keeps SQLite runtime/*.db* files on local tmpfs
+	// instead of GCS FUSE (which fails on out-of-order SQLite -shm writes).
+	if envData, errReadEnv := os.ReadFile(filepath.Join(dataDir, ".env")); errReadEnv == nil {
+		_ = os.WriteFile(filepath.Join(tmpDir, ".env"), envData, 0600)
+	}
+	if cfgData, errReadCfg := os.ReadFile(filepath.Join(dataDir, "config.json")); errReadCfg == nil {
+		_ = os.WriteFile(filepath.Join(tmpDir, "config.json"), cfgData, 0600)
+	}
+
 	logPath := filepath.Join(tmpDir, "backend.log")
 	logFile, errOpen := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if errOpen != nil {
@@ -380,7 +398,7 @@ func StartBackend(ctx context.Context, dataDir string, cfg *MagpieConfig, inheri
 	}
 
 	cmd := exec.Command(binPath, "-open-ui=false")
-	cmd.Dir = dataDir
+	cmd.Dir = tmpDir
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
@@ -400,7 +418,7 @@ func StartBackend(ctx context.Context, dataDir string, cfg *MagpieConfig, inheri
 
 	if errStart := cmd.Start(); errStart != nil {
 		_ = logFile.Close()
-		return nil, fmt.Errorf("failed to spawn AIStudio2API (bin=%s, cwd=%s): %w", binPath, dataDir, errStart)
+		return nil, fmt.Errorf("failed to spawn AIStudio2API (bin=%s, cwd=%s): %w", binPath, tmpDir, errStart)
 	}
 
 	pidPath := filepath.Join(tmpDir, "backend.pid")
@@ -420,7 +438,16 @@ func StartBackend(ctx context.Context, dataDir string, cfg *MagpieConfig, inheri
 		}
 	}
 
-	return CheckServiceStatus(ctx, dataDir)
+	st, errFinal := CheckServiceStatus(ctx, dataDir)
+	if errFinal != nil {
+		if tailBytes, errTail := os.ReadFile(logPath); errTail == nil && len(tailBytes) > 0 {
+			if len(tailBytes) > 1024 {
+				tailBytes = tailBytes[len(tailBytes)-1024:]
+			}
+			return nil, fmt.Errorf("%w (backend.log tail: %s)", errFinal, strings.TrimSpace(string(tailBytes)))
+		}
+	}
+	return st, errFinal
 }
 
 // StopBackend stops the managed AIStudio2API process gracefully via /api/control/stop

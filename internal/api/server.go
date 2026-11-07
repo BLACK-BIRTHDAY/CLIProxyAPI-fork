@@ -136,7 +136,13 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 	// Create gin engine
 	engine := gin.New()
-	if errSetTrustedProxies := engine.SetTrustedProxies(cfg.TrustedProxies); errSetTrustedProxies != nil {
+	trustedProxies := cfg.TrustedProxies
+	if len(trustedProxies) == 0 && strings.TrimSpace(os.Getenv("K_SERVICE")) != "" {
+		// On Google Cloud Run, requests arrive via the internal GFE/load-balancer proxy
+		// on the 169.254.0.0/16 link-local range with client IP in X-Forwarded-For.
+		trustedProxies = []string{"127.0.0.1/8", "::1/128", "169.254.0.0/16"}
+	}
+	if errSetTrustedProxies := engine.SetTrustedProxies(trustedProxies); errSetTrustedProxies != nil {
 		log.WithError(errSetTrustedProxies).Error("invalid trusted-proxies configuration; forwarded client IP headers will be ignored")
 		if errDisableTrustedProxies := engine.SetTrustedProxies(nil); errDisableTrustedProxies != nil {
 			log.WithError(errDisableTrustedProxies).Error("failed to disable trusted proxy handling")
