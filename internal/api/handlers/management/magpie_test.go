@@ -3,8 +3,12 @@ package management
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -376,4 +380,111 @@ func TestMagpieDirectPluginHandlers(t *testing.T) {
 	if loadedCfg.Enabled {
 		t.Errorf("loadedCfg.Enabled = true, want false")
 	}
+}
+
+func TestMagpieLoginAndReloginHandlers(t *testing.T) {
+	tmpDataDir := t.TempDir()
+	t.Setenv("AI_STUDIO_DATA_DIR", tmpDataDir)
+	t.Setenv("MAGPIE_BUILTIN_MENU", "1")
+
+	// Set up mock AIStudio2API daemon server
+	mockDaemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/auth/login" && r.Method == http.MethodPost:
+			http.SetCookie(w, &http.Cookie{Name: "aistudio_admin", Value: "mock-session-cookie"})
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"success":true}`))
+		case r.URL.Path == "/api/status" && r.Method == http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"running":true,"ready":true,"state":"RUNNING","version":"0.2.19-magpie.1"}`))
+		case r.URL.Path == "/api/accounts" && r.Method == http.MethodPost:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"success":true,"action":"login_started"}`))
+		case r.URL.Path == "/api/accounts/acc-test/login" && r.Method == http.MethodPost:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"success":true,"account_id":"acc-test"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer mockDaemon.Close()
+
+	parts := strings.Split(mockDaemon.Listener.Addr().String(), ":")
+	port, errPort := strconv.Atoi(parts[len(parts)-1])
+	if errPort != nil {
+		t.Fatalf("failed to parse mock server port: %v", errPort)
+	}
+
+	// Write config.json pointing to the mock server port
+	cfgJSON := fmt.Sprintf(`{
+		"version": 1,
+		"port": %d,
+		"apiKey": "as_testkey123",
+		"adminUsername": "magpie",
+		"adminPassword": "testpassword"
+	}`, port)
+	if errWrite := os.WriteFile(filepath.Join(tmpDataDir, "config.json"), []byte(cfgJSON), 0644); errWrite != nil {
+		t.Fatalf("failed to write config.json: %v", errWrite)
+	}
+
+	gin.SetMode(gin.TestMode)
+	h := &Handler{
+		cfg:            &config.Config{},
+		configFilePath: writeTestConfigFile(t),
+	}
+
+	router := gin.New()
+	router.POST("/v8/management/magpie/accounts/login", h.LoginMagpieAccount)
+	router.POST("/v8/management/magpie/accounts/:accountId/relogin", h.ReloginMagpieAccount)
+
+	// 1. Test POST /v8/management/magpie/accounts/login
+	t.Run("login_new_account", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v8/management/magpie/accounts/login", nil)
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("POST /v8/management/magpie/accounts/login status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to unmarshal response: %v", err)
+		}
+		if action, ok := resp["action"].(string); !ok || action != "login_started" {
+			t.Errorf("resp[action] = %v, want 'login_started'", resp["action"])
+		}
+	})
+
+	// 2. Test POST /v8/management/magpie/accounts/acc-test/relogin
+	t.Run("relogin_existing_account", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v8/management/magpie/accounts/acc-test/relogin", nil)
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("POST /v8/management/magpie/accounts/acc-test/relogin status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to unmarshal response: %v", err)
+		}
+		if accID, ok := resp["account_id"].(string); !ok || accID != "acc-test" {
+			t.Errorf("resp[account_id] = %v, want 'acc-test'", resp["account_id"])
+		}
+	})
+
+	// 3. Test POST /v8/management/magpie/accounts/%20/relogin with whitespace accountId
+	t.Run("relogin_empty_account_id", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v8/management/magpie/accounts/%20/relogin", nil)
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("POST /v8/management/magpie/accounts/%%20/relogin status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+	})
 }

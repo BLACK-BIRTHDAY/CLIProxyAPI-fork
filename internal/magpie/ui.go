@@ -639,6 +639,10 @@ const quotaPageHTML = `<!DOCTYPE html>
         </div>
       </div>
       <div class="toolbar">
+        <button id="btn-login" class="btn btn-primary" style="display:none;" onclick="handleBrowserLogin()">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          + 浏览器登录账号
+        </button>
         <button id="btn-refresh" class="btn" onclick="fetchData(true)">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
           刷新状态
@@ -663,7 +667,7 @@ const quotaPageHTML = `<!DOCTYPE html>
     </div>
 
     <!-- Cloud Run Headless Notice Banner -->
-    <div class="banner">
+    <div class="banner" id="headless-banner">
       <div class="banner-title">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
         Cloud Run 无头运行提示 (Headless Gateway)
@@ -742,7 +746,7 @@ const quotaPageHTML = `<!DOCTYPE html>
               <th>邮箱 / 标签</th>
               <th>活跃冷却与支持模型</th>
               <th style="width: 80px; text-align: center;">启用</th>
-              <th style="width: 80px; text-align: center;">操作</th>
+              <th style="width: 100px; text-align: center;">操作</th>
             </tr>
           </thead>
           <tbody id="accounts-tbody">
@@ -819,6 +823,7 @@ const quotaPageHTML = `<!DOCTYPE html>
     var searchQuery = '';
     var accountToDelete = null;
     var pendingAuthRetry = null;
+    var isCamoufoxReady = false;
 
     // Theme sync
     function initThemeSync() {
@@ -1243,6 +1248,14 @@ const quotaPageHTML = `<!DOCTYPE html>
           }
         }
 
+        var showRelogin = isCamoufoxReady || state === 'auth_required';
+        var reloginBtnHtml = '';
+        if (showRelogin) {
+          reloginBtnHtml = '<button class="btn btn-sm" title="重新登录授权" style="margin-right:4px;" onclick="handleReloginAccount(\'' + escapeJsString(acc.id) + '\')">' +
+            '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>' +
+          '</button>';
+        }
+
         html += '<tr>' +
           '<td>' + badgeHtml + '</td>' +
           '<td>' +
@@ -1266,8 +1279,9 @@ const quotaPageHTML = `<!DOCTYPE html>
               '<span class="slider"></span>' +
             '</label>' +
           '</td>' +
-          '<td style="text-align:center;">' +
-            '<button class="btn btn-sm btn-danger" onclick="openDeleteModal(\'' + escapeJsString(acc.id) + '\', \'' + escapeJsString(acc.email || acc.label || acc.id) + '\')">' +
+          '<td style="text-align:center;white-space:nowrap;">' +
+            reloginBtnHtml +
+            '<button class="btn btn-sm btn-danger" title="删除账号" onclick="openDeleteModal(\'' + escapeJsString(acc.id) + '\', \'' + escapeJsString(acc.email || acc.label || acc.id) + '\')">' +
               '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>' +
             '</button>' +
           '</td>' +
@@ -1372,6 +1386,17 @@ const quotaPageHTML = `<!DOCTYPE html>
         rawStatus = results[0];
         rawQuota = results[1];
 
+        isCamoufoxReady = Boolean((rawStatus && rawStatus.install && rawStatus.install.camoufox_ready) || (rawQuota && rawQuota.status && rawQuota.status.camoufox && rawQuota.status.camoufox.ready));
+
+        var btnLogin = document.getElementById('btn-login');
+        if (btnLogin) {
+          btnLogin.style.display = isCamoufoxReady ? 'inline-flex' : 'none';
+        }
+        var headlessBanner = document.getElementById('headless-banner');
+        if (headlessBanner) {
+          headlessBanner.style.display = isCamoufoxReady ? 'none' : 'flex';
+        }
+
         if (rawQuota && Array.isArray(rawQuota.accounts)) {
           allAccounts = rawQuota.accounts;
         } else if (rawQuota && rawQuota.data && Array.isArray(rawQuota.data.accounts)) {
@@ -1453,6 +1478,45 @@ const quotaPageHTML = `<!DOCTYPE html>
         showToast('删除失败: ' + err.message, 'error');
       }).finally(function() {
         if (btn) btn.disabled = false;
+      });
+    }
+
+    // Browser Login (Desktop Camoufox)
+    function handleBrowserLogin() {
+      var btn = document.getElementById('btn-login');
+      if (btn) btn.disabled = true;
+      showToast('正在启动 Camoufox 浏览器登录，请在弹出的窗口中登录 Google 账号...', 'info');
+
+      fetchApi('/v8/management/magpie/accounts/login', {
+        method: 'POST'
+      }).then(function(res) {
+        var r = (res && res.data) ? res.data : res;
+        var msg = (r && (r.message || r.status || r.email || r.id)) ? (r.message || r.status || r.email || r.id) : '登录成功';
+        showToast('账号登录成功: ' + msg, 'success');
+        fetchData(false);
+      }).catch(function(err) {
+        showToast('浏览器登录失败: ' + err.message, 'error');
+      }).finally(function() {
+        if (btn) btn.disabled = false;
+      });
+    }
+
+    // Re-login Account (Desktop Camoufox)
+    function handleReloginAccount(accountId) {
+      if (!accountId) return;
+      showToast('正在启动 Camoufox 浏览器重新授权账号 ' + accountId + '...', 'info');
+
+      fetchApi('/v8/management/magpie/accounts/' + encodeURIComponent(accountId) + '/relogin', {
+        method: 'POST'
+      }).then(function(res) {
+        var r = (res && res.data) ? res.data : res;
+        var msg = (r && (r.message || r.status)) ? (r.message || r.status) : '重新授权成功';
+        showToast('账号重新授权成功: ' + msg, 'success');
+        fetchData(false);
+      }).catch(function(err) {
+        showToast('重新登录失败: ' + err.message, 'error');
+      }).finally(function() {
+        fetchData(false);
       });
     }
 

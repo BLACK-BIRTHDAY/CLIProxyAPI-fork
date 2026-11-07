@@ -144,6 +144,48 @@ func (h *Handler) DeleteMagpieAccount(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
+// LoginMagpieAccount triggers interactive Camoufox browser login to add a new MAGPIE account.
+func (h *Handler) LoginMagpieAccount(c *gin.Context) {
+	proxyURL := h.effectiveProxyURL()
+	dataDir := magpie.ResolveDataDir("")
+	cfg, err := magpie.LoadGatewayConfig(dataDir, proxyURL)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	res, errLogin := magpie.LoginNewAccount(c.Request.Context(), dataDir, cfg, proxyURL)
+	if errLogin != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errLogin.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, res)
+}
+
+// ReloginMagpieAccount triggers interactive Camoufox browser re-login for an existing MAGPIE account.
+func (h *Handler) ReloginMagpieAccount(c *gin.Context) {
+	accountID := c.Param("accountId")
+	if strings.TrimSpace(accountID) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "accountId is required"})
+		return
+	}
+
+	proxyURL := h.effectiveProxyURL()
+	dataDir := magpie.ResolveDataDir("")
+	cfg, err := magpie.LoadGatewayConfig(dataDir, proxyURL)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	res, errRelogin := magpie.ReloginAccount(c.Request.Context(), dataDir, cfg, proxyURL, accountID)
+	if errRelogin != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errRelogin.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, res)
+}
+
 // ExportMagpieAccounts exports all accounts into an Account State Bundle.
 func (h *Handler) ExportMagpieAccounts(c *gin.Context) {
 	dataDir := magpie.ResolveDataDir("")

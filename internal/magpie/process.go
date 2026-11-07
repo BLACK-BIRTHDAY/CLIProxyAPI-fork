@@ -128,11 +128,18 @@ func GetInstallStatus(dataDir string) MagpieInstallStatus {
 		}
 	}
 
+	camoufoxReady := false
+	if PreinstalledBinaryPath() == "" && strings.TrimSpace(os.Getenv("K_SERVICE")) == "" {
+		if fi, err := os.Stat(filepath.Join(dataDir, "runtime", "camoufox")); err == nil && fi.IsDir() {
+			camoufoxReady = true
+		}
+	}
+
 	return MagpieInstallStatus{
 		Installed:     installed,
 		Version:       version,
 		BinaryPath:    resolvedBin,
-		CamoufoxReady: false,
+		CamoufoxReady: camoufoxReady,
 		DataDir:       dataDir,
 		ManifestValid: manifestValid,
 	}
@@ -397,8 +404,12 @@ func StartBackend(ctx context.Context, dataDir string, cfg *MagpieConfig, inheri
 		}
 	}
 
+	workDir := dataDir
+	if PreinstalledBinaryPath() != "" || strings.TrimSpace(os.Getenv("K_SERVICE")) != "" {
+		workDir = tmpDir
+	}
 	cmd := exec.Command(binPath, "-open-ui=false")
-	cmd.Dir = tmpDir
+	cmd.Dir = workDir
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
@@ -418,7 +429,7 @@ func StartBackend(ctx context.Context, dataDir string, cfg *MagpieConfig, inheri
 
 	if errStart := cmd.Start(); errStart != nil {
 		_ = logFile.Close()
-		return nil, fmt.Errorf("failed to spawn AIStudio2API (bin=%s, cwd=%s): %w", binPath, tmpDir, errStart)
+		return nil, fmt.Errorf("failed to spawn AIStudio2API (bin=%s, cwd=%s): %w", binPath, workDir, errStart)
 	}
 
 	pidPath := filepath.Join(tmpDir, "backend.pid")
@@ -586,8 +597,12 @@ func HasImportedAccounts(dataDir string) bool {
 }
 
 // AutoStartBackground starts the managed backend in a background goroutine if enabled,
-// auto_start is true, and at least one imported account exists.
+// auto_start is true, and at least one imported account exists. It also activates the built-in
+// plugin menu entry if the backend is installed or configured.
 func AutoStartBackground(ctx context.Context, inheritedProxy string) {
+	if IsInstalledOrConfigured() {
+		ActivateBuiltinMenu()
+	}
 	dataDir := ResolveDataDir("")
 	cfg, errLoad := LoadGatewayConfig(dataDir, inheritedProxy)
 	if errLoad == nil && cfg.Enabled && cfg.AutoStart && HasImportedAccounts(dataDir) {

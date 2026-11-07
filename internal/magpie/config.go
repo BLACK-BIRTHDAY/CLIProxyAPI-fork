@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -76,13 +77,24 @@ func (c *MagpieConfig) NormalizeWorkerLimits() (warmLimit, maxActive, warmStartu
 	return c.WarmWorkerLimit, c.MaxActiveWorkers, c.WarmStartupConcurrency
 }
 
+var builtinMenuActivated atomic.Bool
+
+// ActivateBuiltinMenu explicitly activates exposure of the built-in MAGPIE plugin entry.
+func ActivateBuiltinMenu() {
+	builtinMenuActivated.Store(true)
+}
+
 // ShouldExposeBuiltinMenu reports whether the built-in MAGPIE plugin entry should be listed in ListPlugins.
-// It is active when pre-installed in the container (/app/magpie/aistudio2api) or explicitly enabled via MAGPIE_BUILTIN_MENU=1.
+// It returns true when pre-installed in the container, explicitly requested via MAGPIE_BUILTIN_MENU=1,
+// or activated dynamically during server lifecycle bootstrap.
 func ShouldExposeBuiltinMenu() bool {
 	if PreinstalledBinaryPath() != "" {
 		return true
 	}
 	if os.Getenv("MAGPIE_BUILTIN_MENU") == "1" {
+		return true
+	}
+	if builtinMenuActivated.Load() {
 		return true
 	}
 	return false

@@ -72,10 +72,28 @@ func TestQuotaPageHTML(t *testing.T) {
 		"/v8/management/magpie/accounts/import",
 		"/v8/management/magpie/accounts/",
 		"/toggle",
+		"/v8/management/magpie/accounts/login",
+		"/relogin",
 	}
 	for _, ep := range requiredEndpoints {
 		if !strings.Contains(html, ep) {
 			t.Errorf("QuotaPageHTML missing required endpoint %q", ep)
+		}
+	}
+
+	// Validate desktop Camoufox login and relogin handlers and adaptive UI tokens
+	desktopTokens := []string{
+		"/v8/management/magpie/accounts/login",
+		"/relogin",
+		"handleBrowserLogin",
+		"handleReloginAccount",
+		"btn-login",
+		"headless-banner",
+		"isCamoufoxReady",
+	}
+	for _, tok := range desktopTokens {
+		if !strings.Contains(html, tok) {
+			t.Errorf("QuotaPageHTML missing desktop token %q", tok)
 		}
 	}
 

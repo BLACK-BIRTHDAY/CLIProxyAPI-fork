@@ -43,6 +43,8 @@ AGENTS.override.md
 graphify-out/
 *.cmd
 *.vbs
+magpie-accounts*.json
+*-bundle.json
 
 # Tooling metadata
 .vscode/*

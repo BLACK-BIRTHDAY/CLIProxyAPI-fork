@@ -170,6 +170,55 @@ func ToggleAccount(ctx context.Context, dataDir string, cfg *MagpieConfig, inher
 	return res, nil
 }
 
+// LoginNewAccount initiates an interactive browser login session via Camoufox to add a new account.
+func LoginNewAccount(ctx context.Context, dataDir string, cfg *MagpieConfig, inheritedProxy string) (any, error) {
+	if err := EnsureRunning(ctx, dataDir, cfg, inheritedProxy); err != nil {
+		return nil, fmt.Errorf("failed to ensure backend running: %w", err)
+	}
+
+	resBytes, err := StudioAdminRequest(ctx, dataDir, "POST", "/api/accounts", map[string]any{}, 15*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	InvalidateModelsCache()
+	var res any
+	_ = json.Unmarshal(resBytes, &res)
+	return res, nil
+}
+
+// ReloginAccount initiates an interactive browser re-login session via Camoufox for an existing account.
+func ReloginAccount(ctx context.Context, dataDir string, cfg *MagpieConfig, inheritedProxy string, accountID string) (any, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil, fmt.Errorf("account_id must not be empty")
+	}
+	if strings.HasPrefix(accountID, ".") {
+		return nil, fmt.Errorf("account_id %q must not start with '.'", accountID)
+	}
+	if strings.Contains(accountID, "/") || strings.Contains(accountID, "\\") || strings.Contains(accountID, "..") {
+		return nil, fmt.Errorf("account_id %q contains invalid path traversal characters", accountID)
+	}
+	for _, r := range accountID {
+		if unicode.IsControl(r) {
+			return nil, fmt.Errorf("account_id %q contains control characters", accountID)
+		}
+	}
+
+	if err := EnsureRunning(ctx, dataDir, cfg, inheritedProxy); err != nil {
+		return nil, fmt.Errorf("failed to ensure backend running: %w", err)
+	}
+
+	reqPath := fmt.Sprintf("/api/accounts/%s/login", url.PathEscape(accountID))
+	resBytes, err := StudioAdminRequest(ctx, dataDir, "POST", reqPath, map[string]any{}, 15*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	InvalidateModelsCache()
+	var res any
+	_ = json.Unmarshal(resBytes, &res)
+	return res, nil
+}
+
 // DeleteAccount removes an account from the running backend and deletes its storage state files.
 func DeleteAccount(ctx context.Context, dataDir string, accountID string) error {
 	accountID = strings.TrimSpace(accountID)

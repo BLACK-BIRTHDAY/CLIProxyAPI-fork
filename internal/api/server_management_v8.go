@@ -77,6 +77,8 @@ func (s *Server) registerManagementV8Routes() {
 	v8.DELETE("/magpie/accounts/:accountId", s.mgmt.DeleteMagpieAccount)
 	v8.GET("/magpie/accounts/export", s.mgmt.ExportMagpieAccounts)
 	v8.POST("/magpie/accounts/import", s.mgmt.ImportMagpieAccounts)
+	v8.POST("/magpie/accounts/login", s.mgmt.LoginMagpieAccount)
+	v8.POST("/magpie/accounts/:accountId/relogin", s.mgmt.ReloginMagpieAccount)
 	v8.POST("/magpie/config", s.mgmt.SaveMagpieConfig)
 	v8.PUT("/magpie/config", s.mgmt.SaveMagpieConfig)
 }
