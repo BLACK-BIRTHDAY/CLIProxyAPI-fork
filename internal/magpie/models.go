@@ -110,6 +110,24 @@ var imageCaps = map[string]bool{
 	"output_resolution": true,
 }
 
+func isDeepResearchModel(id string, caps map[string]any) bool {
+	return strings.HasPrefix(id, "deep-research-") && caps != nil && caps["interaction_route"] == true
+}
+
+func hasDisallowedNonTextCapability(caps map[string]any, isImage, isResearch bool) bool {
+	if caps == nil {
+		return false
+	}
+	for _, capName := range nonTextCaps {
+		if isSet, ok := caps[capName].(bool); ok && isSet {
+			if !(isImage && imageCaps[capName]) && !(isResearch && capName == "interactions_api") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // FilterStudioModels filters raw models returned by GET /v1/models from AIStudio2API.
 // It is an exact port of filter_studio_models in antigravity tools.
 func FilterStudioModels(rawModels []map[string]any, allowImageModels bool) []MagpieModelInfo {
@@ -130,7 +148,7 @@ func FilterStudioModels(rawModels []map[string]any, allowImageModels bool) []Mag
 			continue
 		}
 		caps, _ := item["capabilities"].(map[string]any)
-		isResearch := strings.HasPrefix(id, "deep-research-") && caps != nil && caps["interaction_route"] == true
+		isResearch := isDeepResearchModel(id, caps)
 		if !strings.HasPrefix(id, "gemini-") && !isResearch {
 			continue
 		}
@@ -192,20 +210,8 @@ func FilterStudioModels(rawModels []map[string]any, allowImageModels bool) []Mag
 			continue
 		}
 
-		// Check non-text capabilities
-		if caps != nil {
-			hasDisallowedNonText := false
-			for _, capName := range nonTextCaps {
-				if isSet, ok := caps[capName].(bool); ok && isSet {
-					if !(isImage && imageCaps[capName]) && !(isResearch && capName == "interactions_api") {
-						hasDisallowedNonText = true
-						break
-					}
-				}
-			}
-			if hasDisallowedNonText {
-				continue
-			}
+		if hasDisallowedNonTextCapability(caps, isImage, isResearch) {
+			continue
 		}
 
 		// Channels check

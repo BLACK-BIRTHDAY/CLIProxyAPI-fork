@@ -749,12 +749,21 @@ export async function cliMain(args = process.argv.slice(2)) {
 
     // Step 1: Check and update Studio Release Pin
     let pinChanged = false;
+    let adapterDeltaNotes = '';
     try {
-      const { pinInfo, standardRelease } = await fetchLatestStudioRelease();
+      const { pinInfo, studioRelease, standardRelease } = await fetchLatestStudioRelease();
       const pinUpdate = updateStudioReleasePinFiles({ repoRoot, pinInfo });
       pinChanged = pinUpdate.changed;
       if (pinChanged) {
         console.log(`[sync-ci] Advanced Studio Release Pin from ${pinUpdate.previousVersion} to ${pinUpdate.newVersion}`);
+        const notes = [];
+        if (studioRelease?.body) {
+          notes.push(`### ${studioRelease.tag_name} Release Notes\n${studioRelease.body}`);
+        }
+        if (standardRelease?.body) {
+          notes.push(`### ${standardRelease.tag_name} Release Notes\n${standardRelease.body}`);
+        }
+        adapterDeltaNotes = notes.join('\n\n');
       } else {
         console.log(`[sync-ci] Studio Release Pin is already at ${pinUpdate.newVersion}`);
       }
@@ -801,32 +810,39 @@ export async function cliMain(args = process.argv.slice(2)) {
     console.log('[sync-ci] Running initial verification gate...');
     const initialVerify = await runVerification({ cwd: repoRoot });
 
-    if (!mergeHadConflicts && initialVerify.ok) {
+    if (!mergeHadConflicts && !adapterDeltaNotes && initialVerify.ok) {
       console.log('[sync-ci] All verification checks passed cleanly without repair.');
       verified = true;
       summary = 'Dual-upstream convergence verified cleanly without conflicts.';
     } else {
-      console.log('[sync-ci] Verification failed or merge had conflicts. Invoking Agentic Conflict Resolution...');
+      console.log('[sync-ci] Verification failed, merge had conflicts, or MAGPIE adapter delta detected. Invoking Agentic Conflict Resolution...');
       const repairContext = [
         `Merge conflicts encountered: ${mergeHadConflicts}`,
+        adapterDeltaNotes ? `MAGPIE upstream release delta notes (inspect internal/magpie/ for any required Go adapter updates):\n${adapterDeltaNotes}` : '',
         `Verification output:\n${initialVerify.output || '(none)'}`
-      ].join('\n');
+      ].filter(Boolean).join('\n\n');
 
-      const repairResult = await runAgenticRepairLoop({
-        baseUrl: process.env.UPSTREAM_AGENT_BASE_URL || 'https://antigravity-manager-963915716511.asia-northeast2.run.app/v1',
-        apiKey: process.env.UPSTREAM_AGENT_API_KEY,
-        model: process.env.UPSTREAM_AGENT_MODEL || 'gemini-3.8-flash-high',
-        maxTurns: 10,
-        contextSummary: repairContext,
-        verifyFn: () => runVerification({ cwd: repoRoot })
-      });
+      try {
+        const repairResult = await runAgenticRepairLoop({
+          baseUrl: process.env.UPSTREAM_AGENT_BASE_URL || 'https://antigravity-manager-963915716511.asia-northeast2.run.app/v1',
+          apiKey: process.env.UPSTREAM_AGENT_API_KEY,
+          model: process.env.UPSTREAM_AGENT_MODEL || 'gemini-3.8-flash-high',
+          maxTurns: 10,
+          contextSummary: repairContext,
+          verifyFn: () => runVerification({ cwd: repoRoot })
+        });
 
-      verified = repairResult.resolved;
-      if (verified) {
-        summary = `Agentic repair succeeded in ${repairResult.turns} turns.`;
-        console.log(`[sync-ci] ${summary}`);
-      } else {
-        summary = `Agentic repair failed after ${repairResult.turns} turns. Last error: ${repairResult.lastError}`;
+        verified = repairResult.resolved;
+        if (verified) {
+          summary = `Agentic repair succeeded in ${repairResult.turns} turns.`;
+          console.log(`[sync-ci] ${summary}`);
+        } else {
+          summary = `Agentic repair failed after ${repairResult.turns} turns. Last error: ${repairResult.lastError}`;
+          console.error(`[sync-ci] ${summary}`);
+        }
+      } catch (agentErr) {
+        verified = false;
+        summary = `Agentic repair encountered an unexpected error: ${agentErr.message}`;
         console.error(`[sync-ci] ${summary}`);
       }
     }

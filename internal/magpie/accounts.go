@@ -102,6 +102,42 @@ func GetQuotaSummary(ctx context.Context, dataDir string) (*MagpieQuotaResponse,
 	}, nil
 }
 
+func unwrapJSONSlice(raw []byte, wrapperKey string) []any {
+	var wrapper map[string]any
+	if err := json.Unmarshal(raw, &wrapper); err == nil {
+		if list, ok := wrapper[wrapperKey].([]any); ok {
+			return list
+		}
+	}
+	var list []any
+	_ = json.Unmarshal(raw, &list)
+	return list
+}
+
+type studioLoginTaskItem struct {
+	Label string `json:"label"`
+	State string `json:"state"`
+	Error string `json:"error"`
+}
+
+type studioLoginTask struct {
+	ID    string                `json:"id"`
+	State string                `json:"state"`
+	Items []studioLoginTaskItem `json:"items"`
+}
+
+func parseStudioLoginTask(raw any) (*studioLoginTask, bool) {
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return nil, false
+	}
+	var task studioLoginTask
+	if err := json.Unmarshal(b, &task); err != nil || strings.TrimSpace(task.ID) == "" {
+		return nil, false
+	}
+	return &task, true
+}
+
 // ToggleAccount enables or disables a MAGPIE account, preserving label, proxy, locale and timezone.
 func ToggleAccount(ctx context.Context, dataDir string, cfg *MagpieConfig, inheritedProxy string, accountID string, enabled bool) (any, error) {
 	if err := EnsureRunning(ctx, dataDir, cfg, inheritedProxy); err != nil {
@@ -114,16 +150,7 @@ func ToggleAccount(ctx context.Context, dataDir string, cfg *MagpieConfig, inher
 	timezone := "Asia/Tokyo"
 
 	if accBytes, err := StudioAdminRequest(ctx, dataDir, "GET", "/api/accounts", nil, 5*time.Second); err == nil {
-		var accMap map[string]any
-		var list []any
-		if err := json.Unmarshal(accBytes, &accMap); err == nil {
-			if l, ok := accMap["accounts"].([]any); ok {
-				list = l
-			}
-		} else {
-			_ = json.Unmarshal(accBytes, &list)
-		}
-		for _, rawItem := range list {
+		for _, rawItem := range unwrapJSONSlice(accBytes, "accounts") {
 			if item, ok := rawItem.(map[string]any); ok {
 				match := false
 				if id, ok := item["id"].(string); ok && id == accountID {
@@ -186,30 +213,23 @@ func runStudioLoginTask(ctx context.Context, dataDir string, reqPath string, acc
 	}
 
 	taskRaw, hasTask := res["task"]
-	taskMap, isTaskMap := taskRaw.(map[string]any)
-	if !hasTask || !isTaskMap || taskMap == nil {
+	currentTask, okTask := parseStudioLoginTask(taskRaw)
+	if !hasTask || !okTask {
 		return res, nil
 	}
-
-	taskID, _ := taskMap["id"].(string)
-	if strings.TrimSpace(taskID) == "" {
-		return res, nil
-	}
+	currentTaskRaw := taskRaw
+	taskID := currentTask.ID
 
 	// Always cleanup the task on completion or context cancellation so running browser tasks are cancelled
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		_, _ = StudioAdminRequest(cleanupCtx, dataDir, "DELETE", "/api/accounts/tasks/"+url.PathEscape(taskID), nil, 3*time.Second)
+		if _, errCleanup := StudioAdminRequest(cleanupCtx, dataDir, "DELETE", "/api/accounts/tasks/"+url.PathEscape(taskID), nil, 3*time.Second); errCleanup != nil {
+			log.Debugf("[MAGPIE] Failed to delete login task %s during cleanup: %v", taskID, errCleanup)
+		}
 	}()
 
-	currentTask := taskMap
-	for {
-		state, _ := currentTask["state"].(string)
-		if state != "running" && state != "pending" {
-			break
-		}
-
+	for currentTask.State == "running" || currentTask.State == "pending" {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -221,54 +241,38 @@ func runStudioLoginTask(ctx context.Context, dataDir string, reqPath string, acc
 			return nil, fmt.Errorf("failed to poll login tasks: %w", errPoll)
 		}
 
-		var tasksList []any
-		var tasksWrapper map[string]any
-		if errTasks := json.Unmarshal(tasksBytes, &tasksWrapper); errTasks == nil {
-			if tList, ok := tasksWrapper["tasks"].([]any); ok {
-				tasksList = tList
-			}
-		} else {
-			_ = json.Unmarshal(tasksBytes, &tasksList)
-		}
-
-		var found map[string]any
-		for _, item := range tasksList {
-			if m, ok := item.(map[string]any); ok {
-				if id, ok := m["id"].(string); ok && id == taskID {
-					found = m
-					break
-				}
+		var foundTask *studioLoginTask
+		var foundRaw any
+		for _, item := range unwrapJSONSlice(tasksBytes, "tasks") {
+			if parsed, ok := parseStudioLoginTask(item); ok && parsed.ID == taskID {
+				foundTask = parsed
+				foundRaw = item
+				break
 			}
 		}
 
-		if found == nil {
+		if foundTask == nil {
 			return nil, fmt.Errorf("login task disappeared before completion")
 		}
-		currentTask = found
+		currentTask = foundTask
+		currentTaskRaw = foundRaw
 	}
 
-	finalState, _ := currentTask["state"].(string)
-	var firstItemState string
-	var firstItemError string
-	var firstItemLabel string
-	if items, ok := currentTask["items"].([]any); ok && len(items) > 0 {
-		if item0, ok := items[0].(map[string]any); ok {
-			firstItemState, _ = item0["state"].(string)
-			firstItemError, _ = item0["error"].(string)
-			firstItemLabel, _ = item0["label"].(string)
-		}
+	var primaryTaskItem studioLoginTaskItem
+	if len(currentTask.Items) > 0 {
+		primaryTaskItem = currentTask.Items[0]
 	}
 
-	if finalState == "failed" || firstItemState == "failed" {
-		errMsg := strings.TrimSpace(firstItemError)
+	if currentTask.State == "failed" || primaryTaskItem.State == "failed" {
+		errMsg := strings.TrimSpace(primaryTaskItem.Error)
 		if errMsg == "" {
 			errMsg = "Google login failed"
 		}
 		return nil, fmt.Errorf("%s", errMsg)
 	}
 
-	if finalState != "done" {
-		return nil, fmt.Errorf("unexpected login task state: %s", finalState)
+	if currentTask.State != "done" {
+		return nil, fmt.Errorf("unexpected login task state: %s", currentTask.State)
 	}
 
 	// Once done, call GET /api/accounts to find the matching account
@@ -277,16 +281,7 @@ func runStudioLoginTask(ctx context.Context, dataDir string, reqPath string, acc
 		return nil, fmt.Errorf("failed to fetch accounts after login task completion: %w", errAccounts)
 	}
 
-	var accList []any
-	var accWrapper map[string]any
-	if errAcc := json.Unmarshal(accBytes, &accWrapper); errAcc == nil {
-		if l, ok := accWrapper["accounts"].([]any); ok {
-			accList = l
-		}
-	} else {
-		_ = json.Unmarshal(accBytes, &accList)
-	}
-
+	accList := unwrapJSONSlice(accBytes, "accounts")
 	var matchedAccount map[string]any
 	for _, rawItem := range accList {
 		item, ok := rawItem.(map[string]any)
@@ -305,8 +300,8 @@ func runStudioLoginTask(ctx context.Context, dataDir string, reqPath string, acc
 				match = true
 			}
 		}
-		if !match && firstItemLabel != "" {
-			if strings.EqualFold(itemID, firstItemLabel) || strings.EqualFold(itemLabel, firstItemLabel) {
+		if !match && primaryTaskItem.Label != "" {
+			if strings.EqualFold(itemID, primaryTaskItem.Label) || strings.EqualFold(itemLabel, primaryTaskItem.Label) {
 				match = true
 			}
 		}
@@ -330,7 +325,7 @@ func runStudioLoginTask(ctx context.Context, dataDir string, reqPath string, acc
 
 	return map[string]any{
 		"account": matchedAccount,
-		"task":    currentTask,
+		"task":    currentTaskRaw,
 	}, nil
 }
 
