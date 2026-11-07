@@ -313,8 +313,30 @@ export async function installLocalStudioBinary({
       throw new Error(`Binary SHA256 mismatch for ${binaryName}: expected ${target.binarySha256}, got ${binaryHash}`);
     }
 
-    // Install to target binary path
+    // Install to target binary path (handle running Windows process gracefully)
     fs.mkdirSync(packageDir, { recursive: true });
+    if (platform === 'win32' && fs.existsSync(targetBinaryPath)) {
+      try {
+        cp.execSync(
+          `powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter \\"Name='${binaryName}'\\" | Where-Object { \\$_.ExecutablePath -eq '${targetBinaryPath.replace(/'/g, "''")}' } | ForEach-Object { Stop-Process -Id \\$_.ProcessId -Force -ErrorAction SilentlyContinue }"`,
+          { stdio: 'ignore' }
+        );
+      } catch {
+        // Ignore process termination errors
+      }
+      const backupPath = `${targetBinaryPath}.old`;
+      try {
+        fs.rmSync(backupPath, { force: true });
+      } catch {}
+      try {
+        fs.renameSync(targetBinaryPath, backupPath);
+        try {
+          fs.rmSync(backupPath, { force: true });
+        } catch {}
+      } catch {
+        // Fall back to direct copy if rename fails
+      }
+    }
     fs.copyFileSync(foundBinary, targetBinaryPath);
     if (platform !== 'win32') {
       try {

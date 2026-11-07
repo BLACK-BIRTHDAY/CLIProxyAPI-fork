@@ -1,4 +1,4 @@
-name: Docker Publish
+name: Docker & Windows Release Publish
 
 on:
   push:
@@ -9,7 +9,7 @@ on:
   workflow_call:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -19,6 +19,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_call' && 'main' || '' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -49,7 +51,7 @@ jobs:
         run: |
           set -e
           OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          SHORT_SHA="${GITHUB_SHA::7}"
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
           BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           VERSION="${GITHUB_REF_NAME}"
 
@@ -90,3 +92,117 @@ jobs:
             BUILD_DATE=${{ steps.meta.outputs.build_date }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  windows-package:
+    name: Build & Publish Windows x64 Update Package
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_call' && 'main' || '' }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build CLIProxyAPI & Bundle MAGPIE Windows x64 Package
+        id: build_win
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          DATE_TAG=$(date -u +%Y%m%d)
+          RELEASE_VERSION="magpie-${DATE_TAG}-${SHORT_SHA}"
+
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
+          echo "release_version=${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
+
+          STAGE_DIR="dist/windows-amd64"
+          rm -rf dist
+          mkdir -p "$STAGE_DIR"
+
+          echo "Building cli-proxy-api.exe (${RELEASE_VERSION})..."
+          CGO_ENABLED=1 GOOS=windows GOARCH=amd64 go build \
+            -buildvcs=false \
+            -ldflags="-s -w -X 'main.Version=${RELEASE_VERSION}' -X 'main.Commit=${SHORT_SHA}' -X 'main.BuildDate=${BUILD_DATE}'" \
+            -o "${STAGE_DIR}/cli-proxy-api.exe" ./cmd/server/
+
+          echo "Downloading and verifying pinned MAGPIE aistudio2api.exe for Windows x64..."
+          AI_STUDIO_DATA_DIR="${STAGE_DIR}/magpie-ai-studio" node scripts/ci-upstream-agent.mjs --install-local
+
+          echo "Downloading latest management.html..."
+          mkdir -p "${STAGE_DIR}/static"
+          curl -fsSL "https://github.com/router-for-me/Cli-Proxy-API-Management-Center/releases/latest/download/management.html" -o "${STAGE_DIR}/static/management.html" || \
+            curl -fsSL "https://cpamc.router-for.me/" -o "${STAGE_DIR}/static/management.html"
+
+          cp LICENSE README.md README_CN.md config.example.yaml "${STAGE_DIR}/"
+          cp "${STAGE_DIR}/cli-proxy-api.exe" "dist/cli-proxy-api-windows-amd64.exe"
+
+          ZIP_VERSIONED="dist/CLIProxyAPI_${RELEASE_VERSION}_windows_amd64.zip"
+          ZIP_LATEST="dist/CLIProxyAPI_windows_amd64.zip"
+
+          powershell -NoProfile -Command "Compress-Archive -Path '${STAGE_DIR}/*' -DestinationPath '${ZIP_VERSIONED}' -Force"
+          cp "$ZIP_VERSIONED" "$ZIP_LATEST"
+
+          (
+            cd dist
+            sha256sum CLIProxyAPI_windows_amd64.zip "CLIProxyAPI_${RELEASE_VERSION}_windows_amd64.zip" cli-proxy-api-windows-amd64.exe > checksums-windows-amd64.txt
+          )
+
+      - name: Upload Windows Package Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CLIProxyAPI-windows-amd64
+          path: |
+            dist/CLIProxyAPI_windows_amd64.zip
+            dist/CLIProxyAPI_${{ steps.build_win.outputs.release_version }}_windows_amd64.zip
+            dist/cli-proxy-api-windows-amd64.exe
+            dist/checksums-windows-amd64.txt
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release (latest)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="latest"
+          TITLE="Latest Automated Build (${{ steps.build_win.outputs.release_version }})"
+          NOTES="Automated build from commit \`${{ steps.build_win.outputs.short_sha }}\` at \`${{ steps.build_win.outputs.build_date }}\`.
+
+          ### Included Assets
+          - \`CLIProxyAPI_windows_amd64.zip\`: Full Windows x64 update bundle (\`cli-proxy-api.exe\` + pinned \`magpie-ai-studio/package/aistudio2api.exe\` + \`static/management.html\` + \`config.example.yaml\`)
+          - \`cli-proxy-api-windows-amd64.exe\`: Standalone Windows x64 gateway executable
+          - \`checksums-windows-amd64.txt\`: SHA-256 digests"
+
+          HEAD_SHA=$(git rev-parse HEAD)
+          git tag -f "$TAG" "$HEAD_SHA"
+          git push origin "refs/tags/${TAG}" --force
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TITLE" --notes "$NOTES" --latest
+          else
+            gh release create "$TAG" --title "$TITLE" --notes "$NOTES" --latest
+          fi
+
+          gh release upload "$TAG" \
+            dist/CLIProxyAPI_windows_amd64.zip \
+            "dist/CLIProxyAPI_${{ steps.build_win.outputs.release_version }}_windows_amd64.zip" \
+            dist/cli-proxy-api-windows-amd64.exe \
+            dist/checksums-windows-amd64.txt \
+            --clobber
