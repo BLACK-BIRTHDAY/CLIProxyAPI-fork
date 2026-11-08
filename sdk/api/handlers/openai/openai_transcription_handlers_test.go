@@ -96,7 +96,7 @@ func buildTestAudioMultipart(t *testing.T, modelName string, fileName string, au
 	return buf.Bytes(), mw.FormDataContentType()
 }
 
-func TestAudioTranscriptionsNormalizesTranscribeLiveAndTolerantPaths(t *testing.T) {
+func TestAudioTranscriptionsAndTranslationsStandardRoutes(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	exec := &transcriptionCaptureExecutor{}
 	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
@@ -110,11 +110,7 @@ func TestAudioTranscriptionsNormalizesTranscribeLiveAndTolerantPaths(t *testing.
 
 	router := gin.New()
 	router.POST("/v1/audio/transcriptions", handler.AudioTranscriptions)
-	router.POST("/v1/audio/transcriptions/*subpath", handler.AudioTranscriptions)
 	router.POST("/v1/audio/translations", handler.AudioTranslations)
-	router.POST("/v1/completions", handler.Completions)
-	router.POST("/v1/chat/completions", handler.ChatCompletions)
-	router.POST("/", handler.AudioTranscriptions)
 
 	cases := []struct {
 		name      string
@@ -131,23 +127,9 @@ func TestAudioTranscriptionsNormalizesTranscribeLiveAndTolerantPaths(t *testing.
 			wantModel: defaultAIStudioTranscribeModel,
 		},
 		{
-			name:      "prefixed AIStudio/gemini-3.5-transcribe-live on okhttp subpath",
-			path:      "/v1/audio/transcriptions/v1/completions",
+			name:      "prefixed AIStudio/gemini-3.5-transcribe-live on /v1/audio/transcriptions",
+			path:      "/v1/audio/transcriptions",
 			model:     "AIStudio/gemini-3.5-transcribe-live",
-			wantPath:  openAITranscriptionsPath,
-			wantModel: defaultAIStudioTranscribeModel,
-		},
-		{
-			name:      "multipart POST on /v1/completions",
-			path:      "/v1/completions",
-			model:     "gemini-3.5-transcribe-live",
-			wantPath:  openAITranscriptionsPath,
-			wantModel: defaultAIStudioTranscribeModel,
-		},
-		{
-			name:      "multipart POST on root /",
-			path:      "/",
-			model:     "gemini-3.5-transcribe-live",
 			wantPath:  openAITranscriptionsPath,
 			wantModel: defaultAIStudioTranscribeModel,
 		},

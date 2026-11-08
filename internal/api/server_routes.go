@@ -81,11 +81,8 @@ func (s *Server) setupRoutes() {
 		v1.POST("/videos/extensions", openaiHandlers.XAIVideosExtensions)
 		v1.GET("/videos/:request_id", openaiHandlers.XAIVideosRetrieve)
 		v1.POST("/audio/speech", openaiHandlers.AudioSpeech)
-		v1.GET("/audio/transcriptions", openaiHandlers.AudioTranscriptionsProbe)
 		v1.POST("/audio/transcriptions", openaiHandlers.AudioTranscriptions)
-		v1.POST("/audio/transcriptions/*subpath", openaiHandlers.AudioTranscriptions)
 		v1.POST("/audio/translations", openaiHandlers.AudioTranslations)
-		v1.POST("/audio/translations/*subpath", openaiHandlers.AudioTranslations)
 		v1.POST("/tts", openaiHandlers.XAITTS)
 		v1.POST("/messages", claudeCodeHandlers.ClaudeMessages)
 		v1.POST("/messages/count_tokens", claudeCodeHandlers.ClaudeCountTokens)
@@ -143,12 +140,6 @@ func (s *Server) setupRoutes() {
 	}
 
 	// Root endpoint
-	s.engine.POST("/", AuthMiddleware(s.accessManager), openaiHandlers.AudioTranscriptions)
-	s.engine.GET("/audio/transcriptions", AuthMiddleware(s.accessManager), openaiHandlers.AudioTranscriptionsProbe)
-	s.engine.POST("/audio/transcriptions", AuthMiddleware(s.accessManager), openaiHandlers.AudioTranscriptions)
-	s.engine.POST("/audio/transcriptions/*subpath", AuthMiddleware(s.accessManager), openaiHandlers.AudioTranscriptions)
-	s.engine.POST("/audio/translations", AuthMiddleware(s.accessManager), openaiHandlers.AudioTranslations)
-	s.engine.POST("/audio/translations/*subpath", AuthMiddleware(s.accessManager), openaiHandlers.AudioTranslations)
 	s.engine.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "CLI Proxy API Server",

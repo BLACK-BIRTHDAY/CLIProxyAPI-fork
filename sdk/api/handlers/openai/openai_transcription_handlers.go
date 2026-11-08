@@ -23,36 +23,8 @@ const (
 	openAITranslationsPath         = "/v1/audio/translations"
 )
 
-func isMultipartFormDataRequest(c *gin.Context) bool {
-	if c == nil || c.Request == nil {
-		return false
-	}
-	ct := strings.ToLower(strings.TrimSpace(c.GetHeader("Content-Type")))
-	return strings.HasPrefix(ct, "multipart/form-data")
-}
-
-// AudioTranscriptionsProbe handles GET connectivity probes on /v1/audio/transcriptions.
-func (h *OpenAIAPIHandler) AudioTranscriptionsProbe(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"status":   "ok",
-		"endpoint": openAITranscriptionsPath,
-		"model":    "gemini-3.5-transcribe-live",
-	})
-}
-
 // AudioTranscriptions handles OpenAI-compatible POST /v1/audio/transcriptions requests.
 func (h *OpenAIAPIHandler) AudioTranscriptions(c *gin.Context) {
-	if !isMultipartFormDataRequest(c) && c != nil && c.Request != nil && c.Request.URL != nil {
-		path := strings.ToLower(strings.TrimSpace(c.Request.URL.Path))
-		switch {
-		case strings.HasSuffix(path, "/chat/completions"):
-			h.ChatCompletions(c)
-			return
-		case strings.HasSuffix(path, "/completions"):
-			h.Completions(c)
-			return
-		}
-	}
 	h.handleAudioMultipart(c, openAITranscriptionsPath)
 }
 
