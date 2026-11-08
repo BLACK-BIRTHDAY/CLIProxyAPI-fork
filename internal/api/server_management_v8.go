@@ -67,18 +67,4 @@ func (s *Server) registerManagementV8Routes() {
 	v8.GET("/plugins/:id/quota", s.mgmt.GetPluginQuota)
 	v8.POST("/plugins/:id/quota", s.mgmt.FetchPluginQuota)
 	v8.DELETE("/plugins/:id/quota", s.mgmt.ResetPluginQuota)
-
-	v8.GET("/magpie/status", s.mgmt.GetMagpieStatus)
-	v8.POST("/magpie/start", s.mgmt.StartMagpie)
-	v8.POST("/magpie/stop", s.mgmt.StopMagpie)
-	v8.POST("/magpie/restart", s.mgmt.RestartMagpie)
-	v8.GET("/magpie/quota", s.mgmt.GetMagpieQuota)
-	v8.PATCH("/magpie/accounts/:accountId/toggle", s.mgmt.ToggleMagpieAccount)
-	v8.DELETE("/magpie/accounts/:accountId", s.mgmt.DeleteMagpieAccount)
-	v8.GET("/magpie/accounts/export", s.mgmt.ExportMagpieAccounts)
-	v8.POST("/magpie/accounts/import", s.mgmt.ImportMagpieAccounts)
-	v8.POST("/magpie/accounts/login", s.mgmt.LoginMagpieAccount)
-	v8.POST("/magpie/accounts/:accountId/relogin", s.mgmt.ReloginMagpieAccount)
-	v8.POST("/magpie/config", s.mgmt.SaveMagpieConfig)
-	v8.PUT("/magpie/config", s.mgmt.SaveMagpieConfig)
 }

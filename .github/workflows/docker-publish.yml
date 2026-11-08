@@ -116,12 +116,7 @@ jobs:
           check-latest: true
           cache: true
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Build CLIProxyAPI & Bundle MAGPIE Windows x64 Package
+      - name: Build CLIProxyAPI Windows x64 Package
         id: build_win
         shell: bash
         env:
@@ -131,7 +126,7 @@ jobs:
           SHORT_SHA=$(git rev-parse --short HEAD)
           BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           DATE_TAG=$(date -u +%Y%m%d)
-          RELEASE_VERSION="magpie-${DATE_TAG}-${SHORT_SHA}"
+          RELEASE_VERSION="cpa-${DATE_TAG}-${SHORT_SHA}"
 
           echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
@@ -146,9 +141,6 @@ jobs:
             -buildvcs=false \
             -ldflags="-s -w -X 'main.Version=${RELEASE_VERSION}' -X 'main.Commit=${SHORT_SHA}' -X 'main.BuildDate=${BUILD_DATE}'" \
             -o "${STAGE_DIR}/cli-proxy-api.exe" ./cmd/server/
-
-          echo "Downloading and verifying pinned MAGPIE aistudio2api.exe for Windows x64..."
-          AI_STUDIO_DATA_DIR="${STAGE_DIR}/magpie-ai-studio" node scripts/ci-upstream-agent.mjs --install-local
 
           echo "Downloading latest management.html..."
           mkdir -p "${STAGE_DIR}/static"
@@ -193,7 +185,7 @@ jobs:
           NOTES="Automated build from commit \`${{ steps.build_win.outputs.short_sha }}\` at \`${{ steps.build_win.outputs.build_date }}\`.
 
           ### Included Assets
-          - \`CLIProxyAPI_windows_amd64.zip\`: Full Windows x64 update bundle (\`cli-proxy-api.exe\` + pinned \`magpie-ai-studio/package/aistudio2api.exe\` + \`static/management.html\` + \`config.example.yaml\`)
+          - \`CLIProxyAPI_windows_amd64.zip\`: Full Windows x64 update bundle (\`cli-proxy-api.exe\` + \`static/management.html\` + \`config.example.yaml\`)
           - \`cli-proxy-api-windows-amd64.exe\`: Standalone Windows x64 gateway executable
           - \`checksums-windows-amd64.txt\`: SHA-256 digests"
 

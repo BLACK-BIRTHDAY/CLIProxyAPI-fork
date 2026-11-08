@@ -54,44 +54,32 @@ _Avoid_: Account ban, quota exhaustion, transient 403
 The cascading flagging of multiple OAuth credentials in a pool caused by replaying a rejected request across sibling accounts in rapid succession without backoff jitter.
 _Avoid_: Retry storm, credential cascade, pool poisoning
 
-### MAGPIE Integration
+### AIStudio2API Native Plugin Integration
 
-**MAGPIE Backend**:
-The managed Google AI Studio upstream service paired with the gateway to execute inference across pooled Google AI Studio accounts.
-_Avoid_: Studio plugin, inner proxy, web backend
+**AIStudio2API Native Plugin**:
+The native C ABI v1 / Schema v10 plugin (`jianli9158/cpa-plugin-aistudio2api`) loaded dynamically by CLIProxyAPI to serve pooled Google AI Studio accounts directly without external sidecar processes or custom UI wrappers.
+_Avoid_: Magpie sidecar, inner proxy, external daemon
 
-**MAGPIE Model**:
-Any model served by the MAGPIE Backend and exposed on the unified gateway under the `(MAGPIE)/` namespace for both Client Model ID and Display Name so downstream clients group it separately while preserving native Gemini capability detection.
-_Avoid_: Studio model, prefixed model
+**AIStudio2API Auth Directory**:
+The standardized storage root at `/root/.cli-proxy-api` (both on Cloud Run mounted via GCS FUSE and on local desktop via user home / config probing) containing accounts, session cookies, and plugin binaries without requiring symlinks or legacy `/root/.antigravity_tools` paths.
+_Avoid_: Magpie data dir, antigravity_tools mount, sidecar runtime
 
 **Account State Bundle**:
-A portable snapshot of MAGPIE Google account session states, browser fingerprints, model catalogs, and WAA interpreters transferred from a desktop login environment into a headless cloud deployment.
-_Avoid_: Cookie dump, auth archive, raw storage state
+A portable snapshot of Google AI Studio account session cookies, credentials, and state transferred into `/root/.cli-proxy-api/aistudio2api/accounts/<email>/` and registered via auth files (`aistudio2api-<email>.json`).
+_Avoid_: Cookie dump, sidecar bundle, raw storage state
 
-**Bidirectional Tool Name Alias**:
-A deterministic per-request mapping between a downstream client tool identifier exceeding Google AI Studio's length limit and a collision-free shortened upstream identifier, applied outbound across declarations and conversation history and reversed inbound on responses.
-_Avoid_: One-way tool truncation, global tool registry
+### Automated Upstream Convergence
 
-**Malformed Empty Upstream Reply**:
-An upstream completion response that terminates with a malformed-generation finish reason without emitting any visible text or tool calls, which the gateway intercepts before streaming to the client and silently retries.
-_Avoid_: Empty stream bug, continuation prompt
-
-### Automated Dual-Upstream Convergence
-
-**Studio Release Pin**:
-The version tag and archive/binary SHA-256 digests that lock the container's pre-installed MAGPIE Backend binary to a verified release from `BUKOWSKIREAL/magpie-gemini-web`.
-_Avoid_: Binary version, studio tag, hardcoded hash
-
-**Dual-Upstream Sync Cycle**:
-A scheduled or manually dispatched reconciliation run that merges upstream `router-for-me/CLIProxyAPI` commits and advances the Studio Release Pin from `BUKOWSKIREAL/magpie-gemini-web` before publishing a refreshed container image.
-_Avoid_: Auto-update job, cron merge, fork sync
+**Upstream Sync Cycle**:
+A scheduled or manually dispatched reconciliation run that merges upstream `router-for-me/CLIProxyAPI` commits before publishing a refreshed container image and release package.
+_Avoid_: Dual-upstream sync, auto-update job, fork sync
 
 **Agentic Conflict Resolution**:
-An automated repair loop invoked during a Dual-Upstream Sync Cycle when a git merge conflict, upstream MAGPIE contract delta, or build/test failure occurs, using a tool-calling LLM agent bounded by compilation and unit-test verification gates.
+An automated repair loop invoked during an Upstream Sync Cycle when a git merge conflict or build/test failure occurs, using a tool-calling LLM agent bounded by `gofmt`, `go build ./cmd/server`, and `go test ./...` verification gates.
 _Avoid_: AI merge, auto-fix script, blind conflict resolution
 
 **Quarantine Sync Branch**:
-An isolated branch pushed when a Dual-Upstream Sync Cycle fails verification after exhausting Agentic Conflict Resolution, preserving the unmerged state and diagnostic logs without advancing `main` or publishing a container image.
+An isolated branch pushed when an Upstream Sync Cycle fails verification after exhausting Agentic Conflict Resolution, preserving the unmerged state and diagnostic logs without advancing `main` or publishing a container image.
 _Avoid_: Failed branch, broken main, dirty sync
 
 

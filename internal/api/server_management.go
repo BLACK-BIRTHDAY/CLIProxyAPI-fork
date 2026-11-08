@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/magpie"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
 	log "github.com/sirupsen/logrus"
 )
@@ -299,30 +298,7 @@ func (s *Server) pluginResourceNoRoute(c *gin.Context) {
 		return
 	}
 	cfg := s.getConfig()
-	if cfg == nil || cfg.Home.Enabled {
-		c.AbortWithStatus(http.StatusNotFound)
-		return
-	}
-
-	path := c.Request.URL.Path
-	if c.Request.Method == http.MethodGet {
-		switch strings.TrimSuffix(path, "/") {
-		case "/v0/resource/plugins/magpie/quota":
-			c.Header("Content-Type", "text/html; charset=utf-8")
-			c.Header("Cache-Control", "no-store")
-			c.Data(http.StatusOK, "text/html; charset=utf-8", magpie.QuotaPageHTML())
-			c.Abort()
-			return
-		case "/v0/resource/plugins/magpie/settings":
-			c.Header("Content-Type", "text/html; charset=utf-8")
-			c.Header("Cache-Control", "no-store")
-			c.Data(http.StatusOK, "text/html; charset=utf-8", magpie.SettingsPageHTML())
-			c.Abort()
-			return
-		}
-	}
-
-	if s.pluginHost == nil {
+	if cfg == nil || cfg.Home.Enabled || s.pluginHost == nil {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}

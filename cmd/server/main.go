@@ -594,45 +594,7 @@ func main() {
 			return
 		}
 		localConfigPath := filepath.Join(wd, "config.yaml")
-		var useProbedConfig bool
-		if _, statErr := os.Stat(localConfigPath); os.IsNotExist(statErr) {
-			probeDirs := []string{
-				os.Getenv("CPA_DATA_DIR"),
-				os.Getenv("WRITABLE_PATH"),
-				"/data",
-				"/root/.antigravity_tools",
-			}
-			for _, candidate := range probeDirs {
-				candidate = strings.TrimSpace(candidate)
-				if candidate == "" {
-					continue
-				}
-				if fi, statDirErr := os.Stat(candidate); statDirErr == nil && fi.IsDir() {
-					candidateConfig := filepath.Join(candidate, "config.yaml")
-					if _, statCfgErr := os.Stat(candidateConfig); os.IsNotExist(statCfgErr) {
-						hasBootstrapEnv := os.Getenv("PORT") != "" ||
-							os.Getenv("K_SERVICE") != "" ||
-							os.Getenv("API_KEY") != "" ||
-							os.Getenv("CPA_API_KEY") != "" ||
-							os.Getenv("WEB_PASSWORD") != "" ||
-							os.Getenv("MANAGEMENT_PASSWORD") != ""
-						if hasBootstrapEnv {
-							_ = os.MkdirAll(filepath.Join(candidate, "auths"), 0755)
-							bootstrapYAML := fmt.Sprintf("# Auto-bootstrapped minimal v8 configuration\nauth-dir: %q\n\nmanagement:\n  allow-remote: true\n\nserver:\n  kv-store:\n    path: \"/tmp/cpa-kv.db\"\n", filepath.Join(candidate, "auths"))
-							if errWrite := os.WriteFile(candidateConfig, []byte(bootstrapYAML), 0644); errWrite == nil {
-								log.Infof("[CONFIG] Auto-bootstrapped clean minimal v8 config at %s", candidateConfig)
-							}
-						}
-					}
-					configFilePath = candidateConfig
-					useProbedConfig = true
-					break
-				}
-			}
-		}
-		if !useProbedConfig {
-			configFilePath = localConfigPath
-		}
+		configFilePath = probeOrBootstrapConfigPath(localConfigPath)
 		cfg, err = config.LoadConfigOptional(configFilePath, isCloudDeploy)
 	}
 	if err != nil {
@@ -976,10 +938,50 @@ func defaultPluginBootstrapConfigPath(defaultPath string) string {
 		return defaultPath
 	}
 	wd, errGetwd := os.Getwd()
-	if errGetwd != nil {
-		return "config.yaml"
+	localConfigPath := "config.yaml"
+	if errGetwd == nil {
+		localConfigPath = filepath.Join(wd, "config.yaml")
 	}
-	return filepath.Join(wd, "config.yaml")
+	return probeOrBootstrapConfigPath(localConfigPath)
+}
+
+func probeOrBootstrapConfigPath(localConfigPath string) string {
+	if _, statErr := os.Stat(localConfigPath); statErr == nil {
+		return localConfigPath
+	}
+	probeDirs := []string{
+		os.Getenv("CPA_DATA_DIR"),
+		os.Getenv("WRITABLE_PATH"),
+		"/root/.cli-proxy-api",
+		"/data",
+	}
+	for _, candidate := range probeDirs {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if fi, statDirErr := os.Stat(candidate); statDirErr == nil && fi.IsDir() {
+			candidateConfig := filepath.Join(candidate, "config.yaml")
+			if _, statCfgErr := os.Stat(candidateConfig); os.IsNotExist(statCfgErr) {
+				hasBootstrapEnv := os.Getenv("PORT") != "" ||
+					os.Getenv("K_SERVICE") != "" ||
+					os.Getenv("API_KEY") != "" ||
+					os.Getenv("CPA_API_KEY") != "" ||
+					os.Getenv("WEB_PASSWORD") != "" ||
+					os.Getenv("MANAGEMENT_PASSWORD") != ""
+				if hasBootstrapEnv {
+					_ = os.MkdirAll(candidate, 0755)
+					_ = os.MkdirAll(filepath.Join(candidate, "plugins"), 0755)
+					bootstrapYAML := fmt.Sprintf("# Auto-bootstrapped minimal v8 configuration\nauth-dir: %q\n\nmanagement:\n  allow-remote: true\n\nserver:\n  kv-store:\n    path: \"/tmp/cpa-kv.db\"\n\nplugins:\n  enabled: true\n  dir: %q\n  configs:\n    aistudio2api:\n      enabled: true\n      data_dir: %q\n", candidate, filepath.Join(candidate, "plugins"), filepath.Join(candidate, "aistudio2api"))
+					if errWrite := os.WriteFile(candidateConfig, []byte(bootstrapYAML), 0644); errWrite == nil {
+						log.Infof("[CONFIG] Auto-bootstrapped clean minimal v8 config at %s", candidateConfig)
+					}
+				}
+			}
+			return candidateConfig
+		}
+	}
+	return localConfigPath
 }
 
 func loadPluginBootstrapConfig(path string) *config.Config {

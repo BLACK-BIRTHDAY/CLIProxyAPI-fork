@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   sync:
-    name: Dual-Upstream Sync & Verification
+    name: Upstream Sync & Verification
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.sync.outputs.changed }}
@@ -41,7 +41,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Run Dual-Upstream Sync Cycle
+      - name: Run Upstream Sync Cycle
         id: sync
         env:
           UPSTREAM_AGENT_BASE_URL: ${{ secrets.UPSTREAM_AGENT_BASE_URL || 'https://antigravity-manager-963915716511.asia-northeast2.run.app/v1' }}
@@ -59,7 +59,7 @@ jobs:
           set -e
           git add -A
           if ! git diff-index --quiet HEAD --; then
-            git commit -m "chore(upstream): complete Dual-Upstream Sync Cycle for CLIProxyAPI and magpie-gemini-web"
+            git commit -m "chore(upstream): sync with upstream router-for-me/CLIProxyAPI"
           fi
           git push origin main
           git push origin HEAD:refs/heads/feat/magpie-cloud-run
@@ -73,9 +73,9 @@ jobs:
           set -e
           git add -A
           if ! git diff-index --quiet HEAD --; then
-            git commit -m "chore(upstream): quarantine failed Dual-Upstream Sync Cycle for run ${GITHUB_RUN_ID}" --allow-empty
+            git commit -m "chore(upstream): quarantine failed Upstream Sync Cycle for run ${GITHUB_RUN_ID}" --allow-empty
           else
-            git commit --allow-empty -m "chore(upstream): quarantine failed Dual-Upstream Sync Cycle for run ${GITHUB_RUN_ID}"
+            git commit --allow-empty -m "chore(upstream): quarantine failed Upstream Sync Cycle for run ${GITHUB_RUN_ID}"
           fi
           SHORT_SHA=$(git rev-parse --short=7 HEAD)
           FAILED_BRANCH="upstream-sync/failed-${SHORT_SHA}"
@@ -83,7 +83,7 @@ jobs:
 
           SUMMARY="${{ steps.sync.outputs.summary }}"
           ISSUE_TITLE="Upstream Sync Failure (${SHORT_SHA})"
-          ISSUE_BODY="Automated Dual-Upstream Convergence failed verification in run #${GITHUB_RUN_ID}.
+          ISSUE_BODY="Automated Upstream Convergence failed verification in run #${GITHUB_RUN_ID}.
 
           **Quarantine Sync Branch:** \`$FAILED_BRANCH\`
           **Run ID:** \`$GITHUB_RUN_ID\`
