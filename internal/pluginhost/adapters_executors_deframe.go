@@ -47,8 +47,13 @@ func (d *executorSSEDeframer) feed(payload []byte) [][]byte {
 	// Fast path: nothing pending, no SSE event seen yet, and the chunk
 	// cannot begin an SSE event. Emit the chunk untouched so bare payloads
 	// keep their boundaries, including bare content that opens with a
-	// newline.
+	// newline. Pure CR/LF chunks (such as Gemini SSE heartbeat blank lines)
+	// carry no data and are dropped so they do not synthesize empty "data: \n\n"
+	// frames downstream.
 	if len(d.buffer) == 0 && !d.sawSSE && !canBeginSSEEvent(payload) {
+		if len(bytes.Trim(payload, "\r\n")) == 0 {
+			return nil
+		}
 		return [][]byte{payload}
 	}
 	d.buffer = append(d.buffer, payload...)
