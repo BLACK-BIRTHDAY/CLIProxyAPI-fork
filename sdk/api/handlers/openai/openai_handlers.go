@@ -116,6 +116,10 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 // Parameters:
 //   - c: The Gin context containing the HTTP request and response
 func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
+	if isMultipartFormDataRequest(c) {
+		h.AudioTranscriptions(c)
+		return
+	}
 	rawJSON, err := handlers.ReadRequestBody(c)
 	// If data retrieval fails, return a 400 Bad Request error.
 	if err != nil {
@@ -167,6 +171,10 @@ func shouldTreatAsResponsesFormat(rawJSON []byte) bool {
 // Parameters:
 //   - c: The Gin context containing the HTTP request and response
 func (h *OpenAIAPIHandler) Completions(c *gin.Context) {
+	if isMultipartFormDataRequest(c) {
+		h.AudioTranscriptions(c)
+		return
+	}
 	rawJSON, err := handlers.ReadRequestBody(c)
 	// If data retrieval fails, return a 400 Bad Request error.
 	if err != nil {

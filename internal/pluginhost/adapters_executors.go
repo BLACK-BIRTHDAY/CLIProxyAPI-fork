@@ -534,6 +534,10 @@ func (a *executorAdapter) prepareExecutorCall(req coreexecutor.Request, opts cor
 		baseModel = req.Model
 	}
 
+	rewrittenModel := normalizePluginExecutorModel(a.provider, baseModel)
+	modelRewritten := rewrittenModel != baseModel
+	baseModel = rewrittenModel
+
 	nativeReq := req
 	nativeOpts := opts
 	var updatesChanged bool
@@ -550,7 +554,8 @@ func (a *executorAdapter) prepareExecutorCall(req coreexecutor.Request, opts cor
 		nativeReq.Payload = translated.Body
 		updatesChanged = translated.ConfigurationUpdatesChanged
 	}
-	hasPluginThinkingTarget := modelInfo != nil ||
+	hasPluginThinkingTarget := modelRewritten ||
+		modelInfo != nil ||
 		registry.LookupModelInfo(baseModel, a.provider) != nil ||
 		thinking.GetProviderApplier(a.provider) != nil
 	originalTranslated := nativeReq.Payload
@@ -610,6 +615,25 @@ func (a *executorAdapter) prepareExecutorCall(req coreexecutor.Request, opts cor
 		inputFormat:     inputFormat,
 		outputFormat:    outputFormat,
 	}, nil
+}
+
+func normalizePluginExecutorModel(provider, model string) string {
+	if !strings.EqualFold(strings.TrimSpace(provider), "aistudio2api") {
+		return model
+	}
+	trimmed := strings.TrimSpace(model)
+	clean := strings.TrimPrefix(trimmed, "models/")
+	for _, prefix := range []string{"aistudio/", "aistudio2api/"} {
+		if len(clean) >= len(prefix) && strings.EqualFold(clean[:len(prefix)], prefix) {
+			clean = strings.TrimSpace(clean[len(prefix):])
+			break
+		}
+	}
+	clean = strings.TrimPrefix(clean, "models/")
+	if strings.EqualFold(clean, "gemini-3.5-transcribe-live") {
+		return "gemini-3.5-transcribe"
+	}
+	return model
 }
 
 func (a *executorAdapter) lookupPluginModelInfo(baseModel string) *registry.ModelInfo {
