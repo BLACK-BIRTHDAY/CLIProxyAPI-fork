@@ -127,6 +127,13 @@ func TestAudioTranscriptionsAndTranslationsStandardRoutes(t *testing.T) {
 			wantModel: defaultAIStudioTranscribeModel,
 		},
 		{
+			name:      "zero-width space prefixed gemini-3.5-transcribe-live",
+			path:      "/v1/audio/transcriptions",
+			model:     "​gemini-3.5-transcribe-live​",
+			wantPath:  openAITranscriptionsPath,
+			wantModel: defaultAIStudioTranscribeModel,
+		},
+		{
 			name:      "prefixed AIStudio/gemini-3.5-transcribe-live on /v1/audio/transcriptions",
 			path:      "/v1/audio/transcriptions",
 			model:     "AIStudio/gemini-3.5-transcribe-live",

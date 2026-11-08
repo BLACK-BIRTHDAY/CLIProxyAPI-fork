@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"strings"
+	"unicode"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
@@ -118,28 +119,43 @@ func (h *OpenAIAPIHandler) selectAIStudioTranscriptionAuth() *coreauth.Auth {
 	}
 }
 
+func stripZeroWidthModelChars(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch r {
+		case 0x200b, 0x200c, 0x200d, 0x200e, 0x200f, 0x2060, 0xfeff, 0x00ad:
+			continue
+		}
+		if unicode.IsControl(r) || (!unicode.IsGraphic(r) && !unicode.IsSpace(r)) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return strings.TrimSpace(b.String())
+}
+
 func normalizeAudioTranscriptionModel(model string) string {
-	trimmed := strings.TrimSpace(model)
+	trimmed := stripZeroWidthModelChars(model)
 	if trimmed == "" {
 		return defaultAIStudioTranscribeModel
 	}
 	trimmed = strings.TrimPrefix(trimmed, "models/")
 	for _, prefix := range []string{"aistudio/", "aistudio2api/", "google/", "gemini/", "openai/"} {
 		if len(trimmed) >= len(prefix) && strings.EqualFold(trimmed[:len(prefix)], prefix) {
-			trimmed = strings.TrimSpace(trimmed[len(prefix):])
+			trimmed = stripZeroWidthModelChars(trimmed[len(prefix):])
 			break
 		}
 	}
 	trimmed = strings.TrimPrefix(trimmed, "models/")
 	if open := strings.LastIndex(trimmed, "("); open > 0 && strings.HasSuffix(trimmed, ")") {
-		trimmed = strings.TrimSpace(trimmed[:open])
+		trimmed = stripZeroWidthModelChars(trimmed[:open])
 	}
-	switch strings.ToLower(trimmed) {
-	case "", "gemini-3.5-transcribe-live", "gemini-3.5-transcribe", "whisper-1", "gpt-4o-transcribe", "gpt-4o-mini-transcribe":
+	lower := strings.ToLower(trimmed)
+	if lower == "" || strings.Contains(lower, "transcribe") || lower == "whisper-1" {
 		return defaultAIStudioTranscribeModel
-	default:
-		return trimmed
 	}
+	return trimmed
 }
 
 func normalizeAudioMultipartRequest(raw []byte, contentType string) ([]byte, string) {
@@ -176,6 +192,7 @@ func normalizeAudioMultipartRequest(raw []byte, contentType string) ([]byte, str
 		if part.FormName() == "model" && part.FileName() == "" {
 			sawModel = true
 			partBytes = []byte(normalizeAudioTranscriptionModel(string(partBytes)))
+			part.Header.Del("Content-Length")
 		}
 		dst, errCreate := writer.CreatePart(part.Header)
 		if errCreate != nil {

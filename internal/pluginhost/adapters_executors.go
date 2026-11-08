@@ -617,11 +617,22 @@ func (a *executorAdapter) prepareExecutorCall(req coreexecutor.Request, opts cor
 	}, nil
 }
 
+func stripZeroWidthChars(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case 0x200b, 0x200c, 0x200d, 0x200e, 0x200f, 0x2060, 0xfeff, 0x00ad:
+			return -1
+		default:
+			return r
+		}
+	}, s)
+}
+
 func normalizePluginExecutorModel(provider, model string) string {
+	trimmed := strings.TrimSpace(stripZeroWidthChars(model))
 	if !strings.EqualFold(strings.TrimSpace(provider), "aistudio2api") {
-		return model
+		return trimmed
 	}
-	trimmed := strings.TrimSpace(model)
 	clean := strings.TrimPrefix(trimmed, "models/")
 	for _, prefix := range []string{"aistudio/", "aistudio2api/"} {
 		if len(clean) >= len(prefix) && strings.EqualFold(clean[:len(prefix)], prefix) {
@@ -633,7 +644,7 @@ func normalizePluginExecutorModel(provider, model string) string {
 	if strings.EqualFold(clean, "gemini-3.5-transcribe-live") {
 		return "gemini-3.5-transcribe"
 	}
-	return model
+	return trimmed
 }
 
 func (a *executorAdapter) lookupPluginModelInfo(baseModel string) *registry.ModelInfo {
