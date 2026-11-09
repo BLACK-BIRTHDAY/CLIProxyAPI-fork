@@ -13,8 +13,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 const (
@@ -45,10 +47,28 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 		return
 	}
 
-	body, contentType := normalizeAudioMultipartRequest(raw, c.GetHeader("Content-Type"))
-	auth := h.selectAIStudioTranscriptionAuth()
+	body, contentType, model, requestedModel := normalizeAudioMultipartRequest(raw, c.GetHeader("Content-Type"))
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	var reqHeaders http.Header
+	if c.Request != nil && c.Request.Header != nil {
+		reqHeaders = c.Request.Header.Clone()
+	}
+	selectionOpts := coreexecutor.Options{
+		Headers:         reqHeaders,
+		OriginalRequest: raw,
+	}
+	auth, selectionModel, errSelect := h.selectAIStudioTranscriptionAuth(cliCtx, model, selectionOpts)
+	if errSelect != nil {
+		writeSpeechError(c, clienterror.HTTPStatusFromErrorOr(errSelect, http.StatusServiceUnavailable), errSelect.Error())
+		cliCancel(errSelect)
+		return
+	}
+	routeModel := ""
+	if selectionModel != "" {
+		routeModel = requestedModel
+	}
+
 	httpReq, errReq := http.NewRequestWithContext(cliCtx, http.MethodPost, targetPath, bytes.NewReader(body))
 	if errReq != nil {
 		writeSpeechError(c, http.StatusBadRequest, fmt.Sprintf("Invalid request: %v", errReq))
@@ -57,7 +77,7 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 	}
 	if c.Request != nil {
 		for k, vals := range c.Request.Header {
-			if strings.EqualFold(k, "Content-Type") || strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "Authorization") {
+			if shouldSkipAudioBridgeRequestHeader(k) {
 				continue
 			}
 			for _, v := range vals {
@@ -71,7 +91,19 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 
 	resp, errDo := h.AuthManager.HttpRequest(cliCtx, auth, httpReq)
 	if errDo != nil {
-		writeSpeechError(c, clienterror.HTTPStatusFromErrorOr(errDo, http.StatusBadGateway), errDo.Error())
+		status := clienterror.HTTPStatusFromErrorOr(errDo, http.StatusBadGateway)
+		h.AuthManager.MarkResult(cliCtx, coreauth.Result{
+			AuthID:            auth.ID,
+			Provider:          auth.Provider,
+			Model:             selectionModel,
+			RouteModel:        routeModel,
+			Success:           false,
+			Error:             &coreauth.Error{Message: errDo.Error(), HTTPStatus: status},
+			Options:           selectionOpts,
+			CredentialVersion: auth.CredentialVersion,
+			RegistrationEpoch: auth.RegistrationEpoch,
+		})
+		writeSpeechError(c, status, errDo.Error())
 		cliCancel(errDo)
 		return
 	}
@@ -83,12 +115,54 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 
 	respBody, errBody := io.ReadAll(resp.Body)
 	if errBody != nil {
+		h.AuthManager.MarkResult(cliCtx, coreauth.Result{
+			AuthID:            auth.ID,
+			Provider:          auth.Provider,
+			Model:             selectionModel,
+			RouteModel:        routeModel,
+			Success:           false,
+			Error:             &coreauth.Error{Message: errBody.Error(), HTTPStatus: http.StatusBadGateway},
+			Options:           selectionOpts,
+			CredentialVersion: auth.CredentialVersion,
+			RegistrationEpoch: auth.RegistrationEpoch,
+		})
 		writeSpeechError(c, http.StatusBadGateway, fmt.Sprintf("Failed to read transcription response: %v", errBody))
 		cliCancel(errBody)
 		return
 	}
 
-	handlers.WriteUpstreamHeaders(c.Writer.Header(), resp.Header)
+	if resp.StatusCode >= http.StatusBadRequest {
+		errMsg := strings.TrimSpace(string(respBody))
+		if errMsg == "" {
+			errMsg = http.StatusText(resp.StatusCode)
+		}
+		h.AuthManager.MarkResult(cliCtx, coreauth.Result{
+			AuthID:            auth.ID,
+			Provider:          auth.Provider,
+			Model:             selectionModel,
+			RouteModel:        routeModel,
+			Success:           false,
+			Error:             &coreauth.Error{Message: errMsg, HTTPStatus: resp.StatusCode},
+			Options:           selectionOpts,
+			CredentialVersion: auth.CredentialVersion,
+			RegistrationEpoch: auth.RegistrationEpoch,
+		})
+	} else {
+		h.AuthManager.MarkResult(cliCtx, coreauth.Result{
+			AuthID:            auth.ID,
+			Provider:          auth.Provider,
+			Model:             selectionModel,
+			RouteModel:        routeModel,
+			Success:           true,
+			CompletedResponse: true,
+			Options:           selectionOpts,
+			CredentialVersion: auth.CredentialVersion,
+			RegistrationEpoch: auth.RegistrationEpoch,
+		})
+	}
+
+	filteredHeaders := handlers.FilterUpstreamHeaders(resp.Header)
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), filteredHeaders)
 	if ct := strings.TrimSpace(resp.Header.Get("Content-Type")); ct != "" {
 		c.Header("Content-Type", ct)
 	} else {
@@ -100,23 +174,40 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 	cliCancel(nil)
 }
 
-func (h *OpenAIAPIHandler) selectAIStudioTranscriptionAuth() *coreauth.Auth {
-	if h != nil && h.AuthManager != nil {
-		for _, candidate := range h.AuthManager.List() {
-			if candidate == nil || candidate.Disabled {
-				continue
-			}
-			prov := strings.ToLower(strings.TrimSpace(candidate.Provider))
-			if prov == aistudioTranscriptionProvider || prov == "aistudio" || prov == "google-aistudio" {
-				return candidate
-			}
+func shouldSkipAudioBridgeRequestHeader(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "content-type", "content-length", "content-encoding", "accept-encoding", "transfer-encoding", "connection", "authorization":
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *OpenAIAPIHandler) selectAIStudioTranscriptionAuth(ctx context.Context, model string, opts coreexecutor.Options) (*coreauth.Auth, string, error) {
+	if h == nil || h.AuthManager == nil {
+		return nil, "", &coreauth.Error{Code: "provider_not_found", Message: "auth manager is nil", HTTPStatus: http.StatusServiceUnavailable}
+	}
+	registryProviders := registry.GetGlobalRegistry().GetModelProviders(model)
+	selectionModel := ""
+	providers := []string{aistudioTranscriptionProvider, "aistudio", "google-aistudio"}
+	if len(registryProviders) > 0 {
+		selectionModel = model
+		providers = registryProviders
+	}
+	var lastErr error
+	for _, prov := range providers {
+		selected, errSelect := h.AuthManager.SelectAuth(ctx, prov, selectionModel, opts)
+		if errSelect == nil && selected != nil {
+			return selected, selectionModel, nil
+		}
+		if errSelect != nil {
+			lastErr = errSelect
 		}
 	}
-	return &coreauth.Auth{
-		ID:       "aistudio2api-default",
-		Provider: aistudioTranscriptionProvider,
-		Status:   coreauth.StatusActive,
+	if lastErr != nil {
+		return nil, selectionModel, lastErr
 	}
+	return nil, selectionModel, &coreauth.Error{Code: "auth_not_found", Message: "no auth available for audio transcription", HTTPStatus: http.StatusServiceUnavailable}
 }
 
 func stripZeroWidthModelChars(s string) string {
@@ -158,58 +249,65 @@ func normalizeAudioTranscriptionModel(model string) string {
 	return trimmed
 }
 
-func normalizeAudioMultipartRequest(raw []byte, contentType string) ([]byte, string) {
+func normalizeAudioMultipartRequest(raw []byte, contentType string) ([]byte, string, string, string) {
 	mediaType, params, errParse := mime.ParseMediaType(contentType)
 	if errParse != nil || !strings.EqualFold(mediaType, "multipart/form-data") {
-		return raw, contentType
+		return raw, contentType, defaultAIStudioTranscribeModel, defaultAIStudioTranscribeModel
 	}
 	boundary := strings.TrimSpace(params["boundary"])
 	if boundary == "" {
-		return raw, contentType
+		return raw, contentType, defaultAIStudioTranscribeModel, defaultAIStudioTranscribeModel
 	}
 
 	reader := multipart.NewReader(bytes.NewReader(raw), boundary)
 	var out bytes.Buffer
 	writer := multipart.NewWriter(&out)
 	if errBoundary := writer.SetBoundary(boundary); errBoundary != nil {
-		return raw, contentType
+		return raw, contentType, defaultAIStudioTranscribeModel, defaultAIStudioTranscribeModel
 	}
 
 	sawModel := false
+	normalizedModel := defaultAIStudioTranscribeModel
+	requestedModel := defaultAIStudioTranscribeModel
 	for {
 		part, errPart := reader.NextPart()
 		if errPart == io.EOF {
 			break
 		}
 		if errPart != nil {
-			return raw, contentType
+			return raw, contentType, normalizedModel, requestedModel
 		}
 		partBytes, errRead := io.ReadAll(part)
 		_ = part.Close()
 		if errRead != nil {
-			return raw, contentType
+			return raw, contentType, normalizedModel, requestedModel
 		}
 		if part.FormName() == "model" && part.FileName() == "" {
 			sawModel = true
-			partBytes = []byte(normalizeAudioTranscriptionModel(string(partBytes)))
+			requestedModel = stripZeroWidthModelChars(string(partBytes))
+			normalizedModel = normalizeAudioTranscriptionModel(string(partBytes))
+			partBytes = []byte(normalizedModel)
 			part.Header.Del("Content-Length")
 		}
 		dst, errCreate := writer.CreatePart(part.Header)
 		if errCreate != nil {
-			return raw, contentType
+			return raw, contentType, normalizedModel, requestedModel
 		}
 		if _, errWrite := dst.Write(partBytes); errWrite != nil {
-			return raw, contentType
+			return raw, contentType, normalizedModel, requestedModel
 		}
 	}
 
 	if !sawModel {
 		if errField := writer.WriteField("model", defaultAIStudioTranscribeModel); errField != nil {
-			return raw, contentType
+			return raw, contentType, normalizedModel, requestedModel
 		}
 	}
 	if errClose := writer.Close(); errClose != nil {
-		return raw, contentType
+		return raw, contentType, normalizedModel, requestedModel
 	}
-	return out.Bytes(), writer.FormDataContentType()
+	if requestedModel == "" {
+		requestedModel = normalizedModel
+	}
+	return out.Bytes(), writer.FormDataContentType(), normalizedModel, requestedModel
 }

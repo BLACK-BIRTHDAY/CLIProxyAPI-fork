@@ -19,11 +19,15 @@ import (
 )
 
 type transcriptionCaptureExecutor struct {
-	mu       sync.Mutex
-	paths    []string
-	models   []string
-	files    []string
-	fileData [][]byte
+	mu          sync.Mutex
+	paths       []string
+	models      []string
+	files       []string
+	fileData    [][]byte
+	authIDs     []string
+	reqHeaders  []http.Header
+	failAuthIDs map[string]int
+	respHeaders http.Header
 }
 
 func (e *transcriptionCaptureExecutor) Identifier() string { return aistudioTranscriptionProvider }
@@ -44,7 +48,7 @@ func (e *transcriptionCaptureExecutor) CountTokens(context.Context, *coreauth.Au
 	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "CountTokens not implemented"}
 }
 
-func (e *transcriptionCaptureExecutor) HttpRequest(_ context.Context, _ *coreauth.Auth, req *http.Request) (*http.Response, error) {
+func (e *transcriptionCaptureExecutor) HttpRequest(_ context.Context, auth *coreauth.Auth, req *http.Request) (*http.Response, error) {
 	if errParse := req.ParseMultipartForm(1 << 20); errParse != nil {
 		return nil, errParse
 	}
@@ -58,17 +62,40 @@ func (e *transcriptionCaptureExecutor) HttpRequest(_ context.Context, _ *coreaut
 	if errRead != nil {
 		return nil, errRead
 	}
+	authID := ""
+	if auth != nil {
+		authID = auth.ID
+	}
 	e.mu.Lock()
 	e.paths = append(e.paths, req.URL.Path)
 	e.models = append(e.models, model)
 	e.files = append(e.files, hdr.Filename)
 	e.fileData = append(e.fileData, data)
+	e.authIDs = append(e.authIDs, authID)
+	e.reqHeaders = append(e.reqHeaders, req.Header.Clone())
+	failStatus := 0
+	if e.failAuthIDs != nil {
+		failStatus = e.failAuthIDs[authID]
+	}
+	respHeaders := http.Header{"Content-Type": []string{"application/json"}}
+	for k, vals := range e.respHeaders {
+		respHeaders[k] = append([]string(nil), vals...)
+	}
 	e.mu.Unlock()
+
+	if failStatus >= http.StatusBadRequest {
+		return &http.Response{
+			StatusCode: failStatus,
+			Header:     respHeaders,
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"upstream quota exceeded"}}`)),
+			Request:    req,
+		}, nil
+	}
 
 	body := `{"text":"hello live transcription"}`
 	return &http.Response{
 		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Header:     respHeaders,
 		Body:       io.NopCloser(strings.NewReader(body)),
 		Request:    req,
 	}, nil
@@ -98,7 +125,14 @@ func buildTestAudioMultipart(t *testing.T, modelName string, fileName string, au
 
 func TestAudioTranscriptionsAndTranslationsStandardRoutes(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	exec := &transcriptionCaptureExecutor{}
+	exec := &transcriptionCaptureExecutor{
+		respHeaders: http.Header{
+			"Set-Cookie":        []string{"sid=secret; HttpOnly"},
+			"Connection":        []string{"X-Internal-Hop"},
+			"X-Internal-Hop":    []string{"should-be-filtered"},
+			"X-Upstream-Custom": []string{"preserved-value"},
+		},
+	}
 	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
 	manager.RegisterExecutor(exec)
 	auth := &coreauth.Auth{ID: "aistudio-auth-1", Provider: aistudioTranscriptionProvider, Status: coreauth.StatusActive}
@@ -155,6 +189,7 @@ func TestAudioTranscriptionsAndTranslationsStandardRoutes(t *testing.T) {
 			payload, ct := buildTestAudioMultipart(t, tc.model, "audio.wav", sampleWAV)
 			req := httptest.NewRequest(http.MethodPost, tc.path, bytes.NewReader(payload))
 			req.Header.Set("Content-Type", ct)
+			req.Header.Set("Accept-Encoding", "gzip, zstd")
 			rec := httptest.NewRecorder()
 			router.ServeHTTP(rec, req)
 			if rec.Code != http.StatusOK {
@@ -163,11 +198,21 @@ func TestAudioTranscriptionsAndTranslationsStandardRoutes(t *testing.T) {
 			if !strings.Contains(rec.Body.String(), "hello live transcription") {
 				t.Fatalf("unexpected body: %s", rec.Body.String())
 			}
+			if got := rec.Header().Get("Set-Cookie"); got != "" {
+				t.Fatalf("Set-Cookie leaked: %q", got)
+			}
+			if got := rec.Header().Get("X-Internal-Hop"); got != "" {
+				t.Fatalf("Connection-scoped header leaked: %q", got)
+			}
+			if got := rec.Header().Get("X-Upstream-Custom"); got != "preserved-value" {
+				t.Fatalf("X-Upstream-Custom = %q, want preserved-value", got)
+			}
 			exec.mu.Lock()
 			gotPath := exec.paths[i]
 			gotModel := exec.models[i]
 			gotFile := exec.files[i]
 			gotData := exec.fileData[i]
+			gotReqHeader := exec.reqHeaders[i]
 			exec.mu.Unlock()
 			if gotPath != tc.wantPath {
 				t.Fatalf("path = %q, want %q", gotPath, tc.wantPath)
@@ -181,6 +226,64 @@ func TestAudioTranscriptionsAndTranslationsStandardRoutes(t *testing.T) {
 			if !bytes.Equal(gotData, sampleWAV) {
 				t.Fatalf("audio bytes mismatch: %q != %q", gotData, sampleWAV)
 			}
+			if got := gotReqHeader.Get("Content-Encoding"); got != "" {
+				t.Fatalf("forwarded Content-Encoding = %q, want empty", got)
+			}
+			if got := gotReqHeader.Get("Accept-Encoding"); got != "" {
+				t.Fatalf("forwarded Accept-Encoding = %q, want empty", got)
+			}
 		})
+	}
+}
+
+func TestAudioTranscriptionsSchedulerSelectsHealthyAuthAfterCooldown(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	exec := &transcriptionCaptureExecutor{
+		failAuthIDs: map[string]int{
+			"aistudio-auth-bad": http.StatusTooManyRequests,
+		},
+	}
+	manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
+	manager.RegisterExecutor(exec)
+	badAuth := &coreauth.Auth{ID: "aistudio-auth-bad", Provider: aistudioTranscriptionProvider, Status: coreauth.StatusActive}
+	goodAuth := &coreauth.Auth{ID: "aistudio-auth-good", Provider: aistudioTranscriptionProvider, Status: coreauth.StatusActive}
+	if _, errReg := manager.Register(context.Background(), badAuth); errReg != nil {
+		t.Fatalf("manager.Register badAuth: %v", errReg)
+	}
+	if _, errReg := manager.Register(context.Background(), goodAuth); errReg != nil {
+		t.Fatalf("manager.Register goodAuth: %v", errReg)
+	}
+	base := apihandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	handler := NewOpenAIAPIHandler(base)
+
+	router := gin.New()
+	router.POST("/v1/audio/transcriptions", handler.AudioTranscriptions)
+
+	sampleWAV := []byte("RIFF\x24\x00\x00\x00WAVEfmt ")
+	payload, ct := buildTestAudioMultipart(t, "gemini-3.5-transcribe-live", "audio.wav", sampleWAV)
+
+	// First request hits badAuth (fill-first picks first sorted ID "aistudio-auth-bad"), returns 429, and marks it in cooldown.
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(payload))
+	req1.Header.Set("Content-Type", ct)
+	rec1 := httptest.NewRecorder()
+	router.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusTooManyRequests {
+		t.Fatalf("first request status = %d, want 429", rec1.Code)
+	}
+
+	// Second request selects through the scheduler, skipping the cooled-down badAuth and using goodAuth.
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(payload))
+	req2.Header.Set("Content-Type", ct)
+	rec2 := httptest.NewRecorder()
+	router.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second request status = %d, want 200: %s", rec2.Code, rec2.Body.String())
+	}
+
+	exec.mu.Lock()
+	gotAuths := append([]string(nil), exec.authIDs...)
+	exec.mu.Unlock()
+	if len(gotAuths) != 2 || gotAuths[0] != "aistudio-auth-bad" || gotAuths[1] != "aistudio-auth-good" {
+		t.Fatalf("auth sequence = %v, want [aistudio-auth-bad aistudio-auth-good]", gotAuths)
 	}
 }
