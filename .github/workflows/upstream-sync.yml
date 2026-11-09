@@ -2,7 +2,8 @@ name: Upstream Sync
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    # 09:00 Beijing Time (UTC+8) -> 01:00 UTC
+    - cron: '0 1 * * *'
   workflow_dispatch:
 
 permissions:
@@ -17,6 +18,7 @@ jobs:
     outputs:
       changed: ${{ steps.sync.outputs.changed }}
       verified: ${{ steps.sync.outputs.verified }}
+      release_tag: ${{ steps.sync.outputs.release_tag }}
       summary: ${{ steps.sync.outputs.summary }}
     steps:
       - name: Checkout repository
@@ -54,11 +56,12 @@ jobs:
         if: steps.sync.outputs.changed == 'true' && steps.sync.outputs.verified == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.sync.outputs.release_tag }}
         run: |
           set -e
           git add -A
           if ! git diff-index --quiet HEAD --; then
-            git commit -m "chore(upstream): sync with upstream router-for-me/CLIProxyAPI"
+            git commit -m "chore(upstream): sync with upstream router-for-me/CLIProxyAPI ${RELEASE_TAG}"
           fi
           git push origin main
           git push origin HEAD:refs/heads/feat/magpie-cloud-run

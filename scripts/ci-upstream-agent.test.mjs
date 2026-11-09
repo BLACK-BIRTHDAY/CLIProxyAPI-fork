@@ -7,10 +7,46 @@ import os from 'node:os';
 import {
   AGENT_TOOLS,
   DEFAULT_TOOL_EXECUTOR,
+  fetchLatestUpstreamRelease,
   runAgenticRepairLoop,
   setGithubOutput,
   cliMain
 } from './ci-upstream-agent.mjs';
+
+test('fetchLatestUpstreamRelease: extracts latest release tag from GitHub API', async () => {
+  const mockFetch = async (url) => {
+    assert.equal(url, 'https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest');
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        tag_name: 'v8.0.61',
+        name: 'v8.0.61',
+        published_at: '2026-11-08T14:31:53Z',
+        html_url: 'https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.61'
+      })
+    };
+  };
+
+  const rel = await fetchLatestUpstreamRelease({ fetchFn: mockFetch });
+  assert.equal(rel.tagName, 'v8.0.61');
+  assert.equal(rel.publishedAt, '2026-11-08T14:31:53Z');
+});
+
+test('fetchLatestUpstreamRelease: throws on HTTP error or missing tag_name', async () => {
+  await assert.rejects(
+    async () => fetchLatestUpstreamRelease({
+      fetchFn: async () => ({ ok: false, status: 404, statusText: 'Not Found' })
+    }),
+    /Failed to fetch latest release/
+  );
+  await assert.rejects(
+    async () => fetchLatestUpstreamRelease({
+      fetchFn: async () => ({ ok: true, status: 200, json: async () => ({}) })
+    }),
+    /did not contain a valid tag_name/
+  );
+});
 
 test('AGENT_TOOLS: contains expected tool definitions and schemas', () => {
   const toolNames = AGENT_TOOLS.map(t => t.function.name);

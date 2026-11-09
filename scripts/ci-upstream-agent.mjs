@@ -335,26 +335,68 @@ export function setGithubOutput(entries, env = process.env) {
 }
 
 /**
+ * Fetch the latest formal release tag of router-for-me/CLIProxyAPI from GitHub API.
+ */
+export async function fetchLatestUpstreamRelease({
+  repo = 'router-for-me/CLIProxyAPI',
+  githubToken = process.env.GITHUB_TOKEN,
+  fetchFn = globalThis.fetch
+} = {}) {
+  const headers = {
+    'User-Agent': 'ci-upstream-agent',
+    'Accept': 'application/vnd.github.v3+json'
+  };
+  if (githubToken) {
+    headers['Authorization'] = `Bearer ${githubToken}`;
+  }
+
+  const url = `https://api.github.com/repos/${repo}/releases/latest`;
+  const res = await fetchFn(url, { headers });
+  if (!res.ok) {
+    throw new Error(`Failed to fetch latest release from ${repo} (${res.status} ${res.statusText})`);
+  }
+
+  const data = await res.json();
+  const tagName = (data?.tag_name || '').trim();
+  if (!tagName) {
+    throw new Error(`Latest release from ${repo} did not contain a valid tag_name`);
+  }
+
+  return {
+    tagName,
+    name: data.name || tagName,
+    publishedAt: data.published_at || '',
+    htmlUrl: data.html_url || ''
+  };
+}
+
+/**
  * Main CLI entrypoint.
  */
 export async function cliMain(args = process.argv.slice(2)) {
   const isSyncCi = args.includes('--sync-ci');
 
   if (isSyncCi) {
-    console.log('[sync-ci] Starting Upstream Sync Cycle for CLIProxyAPI...');
+    console.log('[sync-ci] Starting Upstream Release Sync Cycle for CLIProxyAPI...');
     const repoRoot = process.cwd();
     let changed = false;
     let verified = false;
     let summary = '';
+    let releaseTag = '';
 
-    // Step 1: Git fetch and merge upstream router-for-me/CLIProxyAPI main
+    // Step 1: Query latest formal GitHub Release of router-for-me/CLIProxyAPI
     let mergeHadConflicts = false;
     let gitMerged = false;
+    let isAlreadySynced = false;
     try {
-      console.log('[sync-ci] Fetching upstream router-for-me/CLIProxyAPI main...');
-      cp.execSync('git fetch https://github.com/router-for-me/CLIProxyAPI.git main', { stdio: 'inherit' });
+      const latestRelease = await fetchLatestUpstreamRelease();
+      releaseTag = latestRelease.tagName;
+      console.log(`[sync-ci] Latest upstream formal release is ${releaseTag} (${latestRelease.publishedAt})`);
 
-      // Check if FETCH_HEAD is already an ancestor of HEAD
+      console.log(`[sync-ci] Fetching upstream release tag ${releaseTag} from router-for-me/CLIProxyAPI...`);
+      cp.execSync(`git fetch https://github.com/router-for-me/CLIProxyAPI.git tag ${releaseTag} --no-tags`, { stdio: 'inherit' });
+
+      // Check if the release tag commit (FETCH_HEAD) is already an ancestor of HEAD
       let isAncestor = false;
       try {
         cp.execSync('git merge-base --is-ancestor FETCH_HEAD HEAD');
@@ -363,20 +405,44 @@ export async function cliMain(args = process.argv.slice(2)) {
         isAncestor = false;
       }
 
-      if (!isAncestor) {
-        console.log('[sync-ci] Merging upstream commits with --no-commit --no-ff...');
+      if (isAncestor) {
+        console.log(`[sync-ci] Upstream release ${releaseTag} is already merged into HEAD. Skipping sync and build.`);
+        isAlreadySynced = true;
+        verified = true;
+        changed = false;
+        summary = `Upstream release ${releaseTag} is already merged.`;
+      } else {
+        console.log(`[sync-ci] Merging upstream release ${releaseTag} with --no-commit --no-ff...`);
         try {
           cp.execSync('git merge --no-commit --no-ff FETCH_HEAD', { stdio: 'inherit' });
           gitMerged = true;
         } catch (mergeErr) {
-          console.warn('[sync-ci] Merge produced conflicts.');
+          console.warn(`[sync-ci] Merge of ${releaseTag} produced conflicts.`);
           mergeHadConflicts = true;
         }
-      } else {
-        console.log('[sync-ci] Upstream CLIProxyAPI is already up-to-date.');
       }
     } catch (err) {
-      console.warn(`[sync-ci] Upstream fetch/merge warning: ${err.message}`);
+      verified = false;
+      summary = `Failed to check or fetch upstream release: ${err.message}`;
+      console.error(`[sync-ci] ${summary}`);
+      setGithubOutput({
+        changed: 'false',
+        verified: 'false',
+        release_tag: releaseTag,
+        summary: summary.replace(/\r?\n/g, ' ')
+      });
+      return;
+    }
+
+    if (isAlreadySynced) {
+      setGithubOutput({
+        changed: 'false',
+        verified: 'true',
+        release_tag: releaseTag,
+        summary: summary.replace(/\r?\n/g, ' ')
+      });
+      console.log(`[sync-ci] Result: changed=false, verified=true, release_tag=${releaseTag}`);
+      return;
     }
 
     // Step 2: Run initial verification
@@ -384,14 +450,15 @@ export async function cliMain(args = process.argv.slice(2)) {
     const initialVerify = await runVerification({ cwd: repoRoot });
 
     if (!mergeHadConflicts && initialVerify.ok) {
-      console.log('[sync-ci] All verification checks passed cleanly without repair.');
+      console.log(`[sync-ci] All verification checks passed cleanly for ${releaseTag} without repair.`);
       verified = true;
-      summary = 'Upstream convergence verified cleanly without conflicts.';
+      summary = `Upstream release ${releaseTag} verified cleanly without conflicts.`;
     } else {
-      console.log('[sync-ci] Verification failed or merge had conflicts:');
+      console.log(`[sync-ci] Verification failed or merge had conflicts for ${releaseTag}:`);
       console.log(initialVerify.output || '(no verification output)');
       console.log('[sync-ci] Invoking Agentic Conflict Resolution...');
       const repairContext = [
+        `Upstream release tag being merged: ${releaseTag}`,
         `Merge conflicts encountered: ${mergeHadConflicts}`,
         `Verification output:\n${initialVerify.output || '(none)'}`
       ].filter(Boolean).join('\n\n');
@@ -408,15 +475,15 @@ export async function cliMain(args = process.argv.slice(2)) {
 
         verified = repairResult.resolved;
         if (verified) {
-          summary = `Agentic repair succeeded in ${repairResult.turns} turns.`;
+          summary = `Agentic repair for ${releaseTag} succeeded in ${repairResult.turns} turns.`;
           console.log(`[sync-ci] ${summary}`);
         } else {
-          summary = `Agentic repair failed after ${repairResult.turns} turns. Last error: ${repairResult.lastError}`;
+          summary = `Agentic repair for ${releaseTag} failed after ${repairResult.turns} turns. Last error: ${repairResult.lastError}`;
           console.error(`[sync-ci] ${summary}`);
         }
       } catch (agentErr) {
         verified = false;
-        summary = `Agentic repair encountered an unexpected error: ${agentErr.message}`;
+        summary = `Agentic repair for ${releaseTag} encountered an unexpected error: ${agentErr.message}`;
         console.error(`[sync-ci] ${summary}`);
       }
     }
@@ -432,10 +499,11 @@ export async function cliMain(args = process.argv.slice(2)) {
     setGithubOutput({
       changed: changed ? 'true' : 'false',
       verified: verified ? 'true' : 'false',
+      release_tag: releaseTag,
       summary: summary.replace(/\r?\n/g, ' ')
     });
 
-    console.log(`[sync-ci] Result: changed=${changed}, verified=${verified}`);
+    console.log(`[sync-ci] Result: changed=${changed}, verified=${verified}, release_tag=${releaseTag}`);
     return;
   }
 
