@@ -850,6 +850,18 @@ func cooldownReason(statusMessage string, quota QuotaState, lastErr *Error) stri
 	return ""
 }
 
+// NextExecutionSeq stamps a new upstream dispatch with the next monotonic
+// execution sequence. The stamp travels on the execution's Result so that
+// MarkResult can order the execution against cooldowns recorded meanwhile.
+func (m *Manager) NextExecutionSeq() uint64 {
+	return m.nextExecutionSeq()
+}
+
+// RuntimeConfigSnapshot returns the current runtime configuration snapshot.
+func (m *Manager) RuntimeConfigSnapshot() *internalconfig.Config {
+	return m.runtimeConfigSnapshot()
+}
+
 // nextExecutionSeq stamps a new upstream dispatch with the next monotonic
 // execution sequence. The stamp travels on the execution's Result so that
 // MarkResult can order the execution against cooldowns recorded meanwhile.

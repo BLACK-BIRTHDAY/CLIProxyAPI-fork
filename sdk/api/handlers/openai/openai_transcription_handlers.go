@@ -5,18 +5,24 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -72,10 +78,24 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 	var reqHeaders http.Header
 	if c.Request != nil && c.Request.Header != nil {
 		reqHeaders = c.Request.Header.Clone()
+	} else {
+		reqHeaders = make(http.Header)
+	}
+	if reqHeaders.Get("Content-Type") == "" && c.GetHeader("Content-Type") != "" {
+		reqHeaders.Set("Content-Type", c.GetHeader("Content-Type"))
+	}
+	routeModel := requestedModel
+	if routeModel == "" {
+		routeModel = model
 	}
 	selectionOpts := coreexecutor.Options{
 		Headers:         reqHeaders,
 		OriginalRequest: raw,
+		SourceFormat:    sdktranslator.FromString("openai"),
+		Metadata: map[string]any{
+			coreexecutor.RequestedModelMetadataKey: routeModel,
+			coreexecutor.RequestPathMetadataKey:    targetPath,
+		},
 	}
 	homeSelection, auth, selectionModel, errSelect := h.selectAIStudioTranscriptionAuth(cliCtx, model, requestedModel, selectionOpts)
 	if errSelect != nil {
@@ -107,10 +127,33 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 			}
 		}()
 	}
-	routeModel := requestedModel
-	if routeModel == "" {
-		routeModel = model
+
+	runtimeCfg := h.AuthManager.RuntimeConfigSnapshot()
+	if runtimeCfg == nil {
+		if sdkCfg := h.CurrentConfig(); sdkCfg != nil {
+			runtimeCfg = &internalconfig.Config{SDKConfig: *sdkCfg}
+		}
 	}
+	finalizedBody, finalizedContentType, errFinalize := helps.ApplyMediaPayloadConfig(
+		runtimeCfg,
+		strings.TrimSpace(auth.Provider),
+		model,
+		"openai",
+		body,
+		contentType,
+		coreexecutor.Request{Model: model, Payload: raw},
+		selectionOpts,
+	)
+	if errFinalize != nil {
+		if homeSelection != nil {
+			homeSelection.End("invalid_request")
+		}
+		writeSpeechError(c, http.StatusBadRequest, fmt.Sprintf("Invalid request: %v", errFinalize))
+		cliCancel(errFinalize)
+		return
+	}
+	body = finalizedBody
+	contentType = finalizedContentType
 
 	targetURL := resolveAudioBridgeTargetURL(auth, targetPath)
 	httpReq, errReq := http.NewRequestWithContext(cliCtx, http.MethodPost, targetURL, bytes.NewReader(body))
@@ -129,6 +172,7 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 		httpReq.Header.Set("Content-Type", contentType)
 	}
 
+	executionSeq := h.AuthManager.NextExecutionSeq()
 	resp, errDo := h.AuthManager.HttpRequest(cliCtx, auth, httpReq)
 	if errDo != nil {
 		if homeSelection != nil {
@@ -145,6 +189,7 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 			Options:           selectionOpts,
 			CredentialVersion: auth.CredentialVersion,
 			RegistrationEpoch: auth.RegistrationEpoch,
+			ExecutionSeq:      executionSeq,
 		})
 		writeSpeechError(c, status, errDo.Error())
 		cliCancel(errDo)
@@ -177,6 +222,7 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 		}()
 	}
 
+	retryAfter := parseAudioBridgeRetryAfterHeader(resp.Header, time.Now())
 	respBody, errBody := io.ReadAll(resp.Body)
 	if errBody != nil {
 		if homeSelection != nil && resp.StatusCode == http.StatusUnauthorized {
@@ -189,9 +235,11 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 			RouteModel:        routeModel,
 			Success:           false,
 			Error:             &coreauth.Error{Message: errBody.Error(), HTTPStatus: http.StatusBadGateway},
+			RetryAfter:        retryAfter,
 			Options:           selectionOpts,
 			CredentialVersion: auth.CredentialVersion,
 			RegistrationEpoch: auth.RegistrationEpoch,
+			ExecutionSeq:      executionSeq,
 		})
 		writeSpeechError(c, http.StatusBadGateway, fmt.Sprintf("Failed to read transcription response: %v", errBody))
 		cliCancel(errBody)
@@ -213,9 +261,11 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 			RouteModel:        routeModel,
 			Success:           false,
 			Error:             &coreauth.Error{Message: errMsg, HTTPStatus: resp.StatusCode},
+			RetryAfter:        retryAfter,
 			Options:           selectionOpts,
 			CredentialVersion: auth.CredentialVersion,
 			RegistrationEpoch: auth.RegistrationEpoch,
+			ExecutionSeq:      executionSeq,
 		})
 	} else {
 		h.AuthManager.MarkResult(cliCtx, coreauth.Result{
@@ -228,6 +278,7 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 			Options:           selectionOpts,
 			CredentialVersion: auth.CredentialVersion,
 			RegistrationEpoch: auth.RegistrationEpoch,
+			ExecutionSeq:      executionSeq,
 		})
 	}
 
@@ -296,35 +347,36 @@ func (h *OpenAIAPIHandler) selectAIStudioTranscriptionAuth(ctx context.Context, 
 			registryProviders = reqProviders
 		}
 	}
-	selectionModel := ""
+	selectionModel := lookupModel
+	if selectionModel == "" {
+		selectionModel = requestedModel
+	}
 	providers := []string{aistudioTranscriptionProvider, "aistudio", "google-aistudio"}
+	selectionCtx := ctx
 	if len(registryProviders) > 0 {
-		selectionModel = lookupModel
 		providers = registryProviders
+	} else {
+		selectionCtx = coreauth.WithRelaxedModelSupport(ctx)
 	}
 	if h.AuthManager.HomeEnabled() {
-		homeModel := selectionModel
-		if homeModel == "" {
-			homeModel = lookupModel
-		}
 		var lastErr error
 		for _, prov := range providers {
-			selection, errSelect := h.AuthManager.SelectHomeAuth(ctx, prov, homeModel, opts)
+			selection, errSelect := h.AuthManager.SelectHomeAuth(ctx, prov, selectionModel, opts)
 			if errSelect == nil && selection != nil {
-				return selection, selection.CloneAuth(), homeModel, nil
+				return selection, selection.CloneAuth(), selectionModel, nil
 			}
 			if errSelect != nil {
 				lastErr = errSelect
 			}
 		}
 		if lastErr != nil {
-			return nil, nil, homeModel, lastErr
+			return nil, nil, selectionModel, lastErr
 		}
-		return nil, nil, homeModel, &coreauth.Error{Code: "auth_not_found", Message: "no auth available for audio transcription", HTTPStatus: http.StatusServiceUnavailable}
+		return nil, nil, selectionModel, &coreauth.Error{Code: "auth_not_found", Message: "no auth available for audio transcription", HTTPStatus: http.StatusServiceUnavailable}
 	}
 	var lastErr error
 	for _, prov := range providers {
-		selected, errSelect := h.AuthManager.SelectAuth(ctx, prov, selectionModel, opts)
+		selected, errSelect := h.AuthManager.SelectAuth(selectionCtx, prov, selectionModel, opts)
 		if errSelect == nil && selected != nil {
 			return nil, selected, selectionModel, nil
 		}
@@ -336,6 +388,32 @@ func (h *OpenAIAPIHandler) selectAIStudioTranscriptionAuth(ctx context.Context, 
 		return nil, nil, selectionModel, lastErr
 	}
 	return nil, nil, selectionModel, &coreauth.Error{Code: "auth_not_found", Message: "no auth available for audio transcription", HTTPStatus: http.StatusServiceUnavailable}
+}
+
+func parseAudioBridgeRetryAfterHeader(headers http.Header, now time.Time) *time.Duration {
+	if headers == nil {
+		return nil
+	}
+	raw := strings.TrimSpace(headers.Get("Retry-After"))
+	if raw == "" {
+		return nil
+	}
+	if seconds, errParse := strconv.ParseInt(raw, 10, 64); errParse == nil && seconds >= 0 {
+		if seconds > int64(math.MaxInt64)/int64(time.Second) {
+			delay := time.Duration(math.MaxInt64)
+			return &delay
+		}
+		delay := time.Duration(seconds) * time.Second
+		return &delay
+	}
+	if deadline, errParse := http.ParseTime(raw); errParse == nil {
+		delay := deadline.Sub(now)
+		if delay < 0 {
+			delay = 0
+		}
+		return &delay
+	}
+	return nil
 }
 
 func stripZeroWidthModelChars(s string) string {

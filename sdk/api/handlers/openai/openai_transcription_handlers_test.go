@@ -10,8 +10,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	apihandlers "github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -25,6 +27,7 @@ type transcriptionCaptureExecutor struct {
 	urls        []string
 	paths       []string
 	models      []string
+	prompts     []string
 	files       []string
 	fileData    [][]byte
 	authIDs     []string
@@ -78,6 +81,7 @@ func (e *transcriptionCaptureExecutor) HttpRequest(_ context.Context, auth *core
 	e.urls = append(e.urls, req.URL.String())
 	e.paths = append(e.paths, req.URL.Path)
 	e.models = append(e.models, model)
+	e.prompts = append(e.prompts, req.FormValue("prompt"))
 	e.files = append(e.files, hdr.Filename)
 	e.fileData = append(e.fileData, data)
 	e.authIDs = append(e.authIDs, authID)
@@ -365,5 +369,137 @@ func TestAudioTranscriptionsResolvesBaseURLForHTTPBackedProviders(t *testing.T) 
 	}
 	if len(gotModels) != 1 || gotModels[0] != "whisper-1" {
 		t.Fatalf("models = %v, want [whisper-1]", gotModels)
+	}
+}
+
+func TestAudioTranscriptionsFallbackAuthSelectionRespectsModelCooldownWithCleanSiblingModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	exec := &transcriptionCaptureExecutor{
+		failAuthIDs: map[string]int{
+			"aistudio-auth-1": http.StatusTooManyRequests,
+		},
+		respHeaders: http.Header{
+			"Retry-After": []string{"120"},
+		},
+	}
+	manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
+	manager.RegisterExecutor(exec)
+
+	// Register two credentials that also have a clean sibling ModelState
+	// (so auth.Unavailable stays false after gemini-3.5-transcribe cools),
+	// and do NOT register gemini-3.5-transcribe in the global model registry
+	// so selectAIStudioTranscriptionAuth exercises the fallback path.
+	auth1 := &coreauth.Auth{
+		ID:       "aistudio-auth-1",
+		Provider: aistudioTranscriptionProvider,
+		Status:   coreauth.StatusActive,
+		ModelStates: map[string]*coreauth.ModelState{
+			"gemini-2.5-pro": {Status: coreauth.StatusActive},
+		},
+	}
+	auth2 := &coreauth.Auth{
+		ID:       "aistudio-auth-2",
+		Provider: aistudioTranscriptionProvider,
+		Status:   coreauth.StatusActive,
+		ModelStates: map[string]*coreauth.ModelState{
+			"gemini-2.5-pro": {Status: coreauth.StatusActive},
+		},
+	}
+	for _, a := range []*coreauth.Auth{auth1, auth2} {
+		if _, errReg := manager.Register(context.Background(), a); errReg != nil {
+			t.Fatalf("manager.Register(%s): %v", a.ID, errReg)
+		}
+		manager.RefreshSchedulerEntry(a.ID)
+	}
+
+	base := apihandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	handler := NewOpenAIAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/audio/transcriptions", handler.AudioTranscriptions)
+
+	sampleWAV := []byte("RIFF\x24\x00\x00\x00WAVEfmt ")
+	payload, ct := buildTestAudioMultipart(t, "gemini-3.5-transcribe-live", "audio.wav", sampleWAV)
+
+	// First request hits aistudio-auth-1 and receives 429 with Retry-After: 120.
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(payload))
+	req1.Header.Set("Content-Type", ct)
+	rec1 := httptest.NewRecorder()
+	router.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusTooManyRequests {
+		t.Fatalf("first request status = %d, want 429: %s", rec1.Code, rec1.Body.String())
+	}
+
+	updatedAuth1, ok := manager.GetByID("aistudio-auth-1")
+	if !ok || updatedAuth1 == nil {
+		t.Fatalf("aistudio-auth-1 not found")
+	}
+	state := updatedAuth1.ModelStates[defaultAIStudioTranscribeModel]
+	if state == nil || !state.Unavailable || state.NextRetryAfter.Before(time.Now().Add(90*time.Second)) {
+		t.Fatalf("expected %s model state to be cooled for ~120s from Retry-After, got %+v", defaultAIStudioTranscribeModel, state)
+	}
+
+	// Second request must skip aistudio-auth-1 (even though its gemini-2.5-pro state is active)
+	// and dispatch to aistudio-auth-2.
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(payload))
+	req2.Header.Set("Content-Type", ct)
+	rec2 := httptest.NewRecorder()
+	router.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second request status = %d, want 200: %s", rec2.Code, rec2.Body.String())
+	}
+
+	exec.mu.Lock()
+	gotAuths := append([]string(nil), exec.authIDs...)
+	exec.mu.Unlock()
+	if len(gotAuths) != 2 || gotAuths[0] != "aistudio-auth-1" || gotAuths[1] != "aistudio-auth-2" {
+		t.Fatalf("selected auth sequence = %v, want [aistudio-auth-1 aistudio-auth-2]", gotAuths)
+	}
+}
+
+func TestAudioTranscriptionsAppliesMediaPayloadRules(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	exec := &transcriptionCaptureExecutor{}
+	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(exec)
+	auth := &coreauth.Auth{
+		ID:       "aistudio-payload-rule-auth",
+		Provider: aistudioTranscriptionProvider,
+		Status:   coreauth.StatusActive,
+	}
+	if _, errReg := manager.Register(context.Background(), auth); errReg != nil {
+		t.Fatalf("manager.Register: %v", errReg)
+	}
+	manager.RefreshSchedulerEntry(auth.ID)
+
+	manager.SetConfig(&internalconfig.Config{
+		Payload: internalconfig.PayloadConfig{
+			Override: []internalconfig.PayloadRule{
+				{
+					Models: []internalconfig.PayloadModelRule{{Name: defaultAIStudioTranscribeModel}},
+					Params: map[string]any{"prompt": "configured subtitle prompt"},
+				},
+			},
+		},
+	})
+	base := apihandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	handler := NewOpenAIAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/audio/transcriptions", handler.AudioTranscriptions)
+
+	sampleWAV := []byte("RIFF\x24\x00\x00\x00WAVEfmt ")
+	payload, ct := buildTestAudioMultipart(t, "gemini-3.5-transcribe-live", "audio.wav", sampleWAV)
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+
+	exec.mu.Lock()
+	gotPrompts := append([]string(nil), exec.prompts...)
+	exec.mu.Unlock()
+	if len(gotPrompts) != 1 || gotPrompts[0] != "configured subtitle prompt" {
+		t.Fatalf("prompts = %v, want [configured subtitle prompt]", gotPrompts)
 	}
 }
