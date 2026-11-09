@@ -388,7 +388,9 @@ export async function cliMain(args = process.argv.slice(2)) {
       verified = true;
       summary = 'Upstream convergence verified cleanly without conflicts.';
     } else {
-      console.log('[sync-ci] Verification failed or merge had conflicts. Invoking Agentic Conflict Resolution...');
+      console.log('[sync-ci] Verification failed or merge had conflicts:');
+      console.log(initialVerify.output || '(no verification output)');
+      console.log('[sync-ci] Invoking Agentic Conflict Resolution...');
       const repairContext = [
         `Merge conflicts encountered: ${mergeHadConflicts}`,
         `Verification output:\n${initialVerify.output || '(none)'}`
