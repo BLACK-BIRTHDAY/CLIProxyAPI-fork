@@ -299,9 +299,14 @@ export async function runVerification({ cwd = process.cwd() } = {}) {
       }
     }
 
-    // 3. go test ./...
+    // 3. go test ./... (isolate from ambient GITHUB_TOKEN / GH_TOKEN so unit tests
+    //    such as internal/pluginstore that check unauthenticated fallback URLs do not fail)
+    const cleanEnv = { ...process.env };
+    delete cleanEnv.GITHUB_TOKEN;
+    delete cleanEnv.GH_TOKEN;
     const testOut = cp.execSync('go test ./...', {
       cwd,
+      env: cleanEnv,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe']
     });
