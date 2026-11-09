@@ -524,7 +524,11 @@ func (a *executorAdapter) prepareExecutorCall(req coreexecutor.Request, opts cor
 		return preparedExecutorCall{}, errOutput
 	}
 
-	baseModel := strings.TrimSpace(req.Model)
+	rawReqModel := req.Model
+	req.Model = strings.TrimSpace(stripZeroWidthChars(req.Model))
+	modelSanitized := req.Model != rawReqModel
+
+	baseModel := req.Model
 	modelInfo := a.lookupPluginModelInfo(baseModel)
 	if parsed := thinking.ParseSuffix(req.Model); parsed.HasSuffix && modelInfo == nil {
 		baseModel = strings.TrimSpace(parsed.ModelName)
@@ -533,10 +537,6 @@ func (a *executorAdapter) prepareExecutorCall(req coreexecutor.Request, opts cor
 	if baseModel == "" {
 		baseModel = req.Model
 	}
-
-	rewrittenModel := normalizePluginExecutorModel(a.provider, baseModel)
-	modelRewritten := rewrittenModel != baseModel
-	baseModel = rewrittenModel
 
 	nativeReq := req
 	nativeOpts := opts
@@ -554,13 +554,12 @@ func (a *executorAdapter) prepareExecutorCall(req coreexecutor.Request, opts cor
 		nativeReq.Payload = translated.Body
 		updatesChanged = translated.ConfigurationUpdatesChanged
 	}
-	hasPluginThinkingTarget := modelRewritten ||
-		modelInfo != nil ||
+	hasPluginThinkingTarget := modelInfo != nil ||
 		registry.LookupModelInfo(baseModel, a.provider) != nil ||
 		thinking.GetProviderApplier(a.provider) != nil
 	originalTranslated := nativeReq.Payload
 	doc := ojson.NewDoc(nativeReq.Payload)
-	if hasPluginThinkingTarget && baseModel != "" && doc.Get("model").Exists() {
+	if (hasPluginThinkingTarget || modelSanitized) && baseModel != "" && doc.Get("model").Exists() {
 		_ = helps.SetStringIfDifferentDoc(doc, "model", baseModel)
 	}
 	if doc.Len() > 0 {
@@ -600,7 +599,7 @@ func (a *executorAdapter) prepareExecutorCall(req coreexecutor.Request, opts cor
 	if doc.Len() > 0 {
 		nativeReq.Payload = doc.Bytes()
 	}
-	if hasPluginThinkingTarget {
+	if hasPluginThinkingTarget || modelSanitized {
 		nativeReq.Model = baseModel
 	}
 	nativeReq.Format = outputFormat
@@ -626,25 +625,6 @@ func stripZeroWidthChars(s string) string {
 			return r
 		}
 	}, s)
-}
-
-func normalizePluginExecutorModel(provider, model string) string {
-	trimmed := strings.TrimSpace(stripZeroWidthChars(model))
-	if !strings.EqualFold(strings.TrimSpace(provider), "aistudio2api") {
-		return trimmed
-	}
-	clean := strings.TrimPrefix(trimmed, "models/")
-	for _, prefix := range []string{"aistudio/", "aistudio2api/"} {
-		if len(clean) >= len(prefix) && strings.EqualFold(clean[:len(prefix)], prefix) {
-			clean = strings.TrimSpace(clean[len(prefix):])
-			break
-		}
-	}
-	clean = strings.TrimPrefix(clean, "models/")
-	if strings.EqualFold(clean, "gemini-3.5-transcribe-live") {
-		return "gemini-3.5-transcribe"
-	}
-	return trimmed
 }
 
 func (a *executorAdapter) lookupPluginModelInfo(baseModel string) *registry.ModelInfo {

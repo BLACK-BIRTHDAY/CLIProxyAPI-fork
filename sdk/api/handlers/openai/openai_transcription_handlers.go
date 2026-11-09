@@ -58,15 +58,15 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 		Headers:         reqHeaders,
 		OriginalRequest: raw,
 	}
-	auth, selectionModel, errSelect := h.selectAIStudioTranscriptionAuth(cliCtx, model, selectionOpts)
+	auth, selectionModel, errSelect := h.selectAIStudioTranscriptionAuth(cliCtx, model, requestedModel, selectionOpts)
 	if errSelect != nil {
 		writeSpeechError(c, clienterror.HTTPStatusFromErrorOr(errSelect, http.StatusServiceUnavailable), errSelect.Error())
 		cliCancel(errSelect)
 		return
 	}
-	routeModel := ""
-	if selectionModel != "" {
-		routeModel = requestedModel
+	routeModel := requestedModel
+	if routeModel == "" {
+		routeModel = model
 	}
 
 	httpReq, errReq := http.NewRequestWithContext(cliCtx, http.MethodPost, targetPath, bytes.NewReader(body))
@@ -183,15 +183,22 @@ func shouldSkipAudioBridgeRequestHeader(name string) bool {
 	}
 }
 
-func (h *OpenAIAPIHandler) selectAIStudioTranscriptionAuth(ctx context.Context, model string, opts coreexecutor.Options) (*coreauth.Auth, string, error) {
+func (h *OpenAIAPIHandler) selectAIStudioTranscriptionAuth(ctx context.Context, model, requestedModel string, opts coreexecutor.Options) (*coreauth.Auth, string, error) {
 	if h == nil || h.AuthManager == nil {
 		return nil, "", &coreauth.Error{Code: "provider_not_found", Message: "auth manager is nil", HTTPStatus: http.StatusServiceUnavailable}
 	}
-	registryProviders := registry.GetGlobalRegistry().GetModelProviders(model)
+	lookupModel := model
+	registryProviders := registry.GetGlobalRegistry().GetModelProviders(lookupModel)
+	if len(registryProviders) == 0 && requestedModel != "" && !strings.EqualFold(requestedModel, lookupModel) {
+		if reqProviders := registry.GetGlobalRegistry().GetModelProviders(requestedModel); len(reqProviders) > 0 {
+			lookupModel = requestedModel
+			registryProviders = reqProviders
+		}
+	}
 	selectionModel := ""
 	providers := []string{aistudioTranscriptionProvider, "aistudio", "google-aistudio"}
 	if len(registryProviders) > 0 {
-		selectionModel = model
+		selectionModel = lookupModel
 		providers = registryProviders
 	}
 	var lastErr error
@@ -231,22 +238,34 @@ func normalizeAudioTranscriptionModel(model string) string {
 	if trimmed == "" {
 		return defaultAIStudioTranscribeModel
 	}
-	trimmed = strings.TrimPrefix(trimmed, "models/")
-	for _, prefix := range []string{"aistudio/", "aistudio2api/", "google/", "gemini/", "openai/"} {
-		if len(trimmed) >= len(prefix) && strings.EqualFold(trimmed[:len(prefix)], prefix) {
-			trimmed = stripZeroWidthModelChars(trimmed[len(prefix):])
+	clean := strings.TrimPrefix(trimmed, "models/")
+	hasAIStudioPrefix := false
+	for _, prefix := range []string{"aistudio/", "aistudio2api/"} {
+		if len(clean) >= len(prefix) && strings.EqualFold(clean[:len(prefix)], prefix) {
+			clean = stripZeroWidthModelChars(clean[len(prefix):])
+			hasAIStudioPrefix = true
 			break
 		}
 	}
-	trimmed = strings.TrimPrefix(trimmed, "models/")
-	if open := strings.LastIndex(trimmed, "("); open > 0 && strings.HasSuffix(trimmed, ")") {
-		trimmed = stripZeroWidthModelChars(trimmed[:open])
+	clean = strings.TrimPrefix(clean, "models/")
+	base := clean
+	if open := strings.LastIndex(base, "("); open > 0 && strings.HasSuffix(base, ")") {
+		base = stripZeroWidthModelChars(base[:open])
 	}
-	lower := strings.ToLower(trimmed)
-	if lower == "" || strings.Contains(lower, "transcribe") || lower == "whisper-1" {
+	switch strings.ToLower(base) {
+	case "", "gemini-3.5-transcribe", "gemini-3.5-transcribe-live":
 		return defaultAIStudioTranscribeModel
+	case "whisper-1":
+		if !hasAIStudioPrefix && len(registry.GetGlobalRegistry().GetModelProviders(trimmed)) > 0 {
+			return trimmed
+		}
+		return defaultAIStudioTranscribeModel
+	default:
+		if hasAIStudioPrefix {
+			return clean
+		}
+		return trimmed
 	}
-	return trimmed
 }
 
 func normalizeAudioMultipartRequest(raw []byte, contentType string) ([]byte, string, string, string) {

@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	apihandlers "github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -19,6 +20,7 @@ import (
 )
 
 type transcriptionCaptureExecutor struct {
+	provider    string
 	mu          sync.Mutex
 	paths       []string
 	models      []string
@@ -30,7 +32,12 @@ type transcriptionCaptureExecutor struct {
 	respHeaders http.Header
 }
 
-func (e *transcriptionCaptureExecutor) Identifier() string { return aistudioTranscriptionProvider }
+func (e *transcriptionCaptureExecutor) Identifier() string {
+	if e.provider != "" {
+		return e.provider
+	}
+	return aistudioTranscriptionProvider
+}
 
 func (e *transcriptionCaptureExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
 	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "Execute not implemented"}
@@ -163,7 +170,7 @@ func TestAudioTranscriptionsAndTranslationsStandardRoutes(t *testing.T) {
 		{
 			name:      "zero-width space prefixed gemini-3.5-transcribe-live",
 			path:      "/v1/audio/transcriptions",
-			model:     "​gemini-3.5-transcribe-live​",
+			model:     string([]rune{0x200b}) + "gemini-3.5-transcribe-live" + string([]rune{0x200b}),
 			wantPath:  openAITranscriptionsPath,
 			wantModel: defaultAIStudioTranscribeModel,
 		},
@@ -173,6 +180,13 @@ func TestAudioTranscriptionsAndTranslationsStandardRoutes(t *testing.T) {
 			model:     "AIStudio/gemini-3.5-transcribe-live",
 			wantPath:  openAITranscriptionsPath,
 			wantModel: defaultAIStudioTranscribeModel,
+		},
+		{
+			name:      "non-alias transcription model preserved",
+			path:      "/v1/audio/transcriptions",
+			model:     "gpt-4o-transcribe",
+			wantPath:  openAITranscriptionsPath,
+			wantModel: "gpt-4o-transcribe",
 		},
 		{
 			name:      "audio translations with gemini-3.5-transcribe-live",
@@ -253,6 +267,16 @@ func TestAudioTranscriptionsSchedulerSelectsHealthyAuthAfterCooldown(t *testing.
 	if _, errReg := manager.Register(context.Background(), goodAuth); errReg != nil {
 		t.Fatalf("manager.Register goodAuth: %v", errReg)
 	}
+	modelReg := registry.GetGlobalRegistry()
+	modelReg.RegisterClient(badAuth.ID, badAuth.Provider, []*registry.ModelInfo{{ID: defaultAIStudioTranscribeModel}})
+	modelReg.RegisterClient(goodAuth.ID, goodAuth.Provider, []*registry.ModelInfo{{ID: defaultAIStudioTranscribeModel}})
+	manager.RefreshSchedulerEntry(badAuth.ID)
+	manager.RefreshSchedulerEntry(goodAuth.ID)
+	t.Cleanup(func() {
+		modelReg.UnregisterClient(badAuth.ID)
+		modelReg.UnregisterClient(goodAuth.ID)
+	})
+
 	base := apihandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
 	handler := NewOpenAIAPIHandler(base)
 
@@ -262,7 +286,7 @@ func TestAudioTranscriptionsSchedulerSelectsHealthyAuthAfterCooldown(t *testing.
 	sampleWAV := []byte("RIFF\x24\x00\x00\x00WAVEfmt ")
 	payload, ct := buildTestAudioMultipart(t, "gemini-3.5-transcribe-live", "audio.wav", sampleWAV)
 
-	// First request hits badAuth (fill-first picks first sorted ID "aistudio-auth-bad"), returns 429, and marks it in cooldown.
+	// First request hits badAuth, returns 429, and marks it in model-scoped cooldown.
 	req1 := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(payload))
 	req1.Header.Set("Content-Type", ct)
 	rec1 := httptest.NewRecorder()
