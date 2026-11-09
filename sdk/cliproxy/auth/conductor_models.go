@@ -203,6 +203,37 @@ func (m *Manager) ResolveExecutionModel(auth *Auth, routeModel string) string {
 	return routeModel
 }
 
+// ResolveExecutionModelForRequest resolves the credential-aware upstream model
+// and corresponding state attribution model for a selected credential.
+// When localfiltering is true, cooled upstream pool members are skipped first.
+func (m *Manager) ResolveExecutionModelForRequest(ctx context.Context, auth *Auth, routeModel string, localFiltering bool, clientHeaders ...http.Header) (upstreamModel, stateModel string) {
+	routeModel = strings.TrimSpace(routeModel)
+	if m == nil {
+		return routeModel, routeModel
+	}
+	var (
+		candidates []string
+		pooled     bool
+	)
+	if localFiltering {
+		candidates, pooled, _, _ = m.preparedExecutionModelsWithAliasForRequest(ctx, auth, routeModel, clientHeaders...)
+	}
+	if len(candidates) == 0 {
+		candidates, pooled, _, _ = m.executionModelCandidatesWithAlias(auth, routeModel)
+	}
+	if len(candidates) > 0 {
+		upstreamModel = strings.TrimSpace(candidates[0])
+	}
+	if upstreamModel == "" {
+		upstreamModel = routeModel
+	}
+	stateModel = m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
+	if strings.TrimSpace(stateModel) == "" {
+		stateModel = routeModel
+	}
+	return upstreamModel, stateModel
+}
+
 func (m *Manager) selectionModelForAuth(auth *Auth, routeModel string) string {
 	requestedModel := rewriteModelForAuth(routeModel, auth)
 	if strings.TrimSpace(requestedModel) == "" {

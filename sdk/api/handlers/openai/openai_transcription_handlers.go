@@ -132,6 +132,21 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 		}()
 	}
 
+	upstreamModel, stateModel := h.AuthManager.ResolveExecutionModelForRequest(cliCtx, auth, selectionModel, homeSelection == nil, reqHeaders)
+	baseUpstreamModel := strings.TrimSpace(thinking.ParseSuffix(upstreamModel).ModelName)
+	if baseUpstreamModel == "" {
+		baseUpstreamModel = strings.TrimSpace(upstreamModel)
+	}
+	if baseUpstreamModel == "" {
+		baseUpstreamModel = model
+	}
+	if strings.TrimSpace(stateModel) != "" {
+		selectionModel = stateModel
+	}
+	if baseUpstreamModel != model {
+		body, contentType = rewriteAudioMultipartModelField(body, contentType, baseUpstreamModel)
+	}
+
 	runtimeCfg := h.AuthManager.RuntimeConfigSnapshot()
 	if runtimeCfg == nil {
 		if sdkCfg := h.CurrentConfig(); sdkCfg != nil {
@@ -141,11 +156,11 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 	finalizedBody, finalizedContentType, errFinalize := helps.ApplyMediaPayloadConfig(
 		runtimeCfg,
 		strings.TrimSpace(auth.Provider),
-		model,
+		baseUpstreamModel,
 		"openai",
 		body,
 		contentType,
-		coreexecutor.Request{Model: model, Payload: raw},
+		coreexecutor.Request{Model: baseUpstreamModel, Payload: raw},
 		selectionOpts,
 	)
 	if errFinalize != nil {
@@ -201,7 +216,7 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 			Model:             selectionModel,
 			RouteModel:        routeModel,
 			Success:           false,
-			Error:             &coreauth.Error{Message: errDo.Error(), HTTPStatus: status},
+			Error:             classifyAudioBridgeError(errDo, status),
 			Options:           selectionOpts,
 			CredentialVersion: auth.CredentialVersion,
 			RegistrationEpoch: auth.RegistrationEpoch,
@@ -262,7 +277,7 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 						Model:             selectionModel,
 						RouteModel:        routeModel,
 						Success:           false,
-						Error:             &coreauth.Error{Message: errWrite.Error(), HTTPStatus: http.StatusBadGateway},
+						Error:             classifyAudioBridgeStreamWriteError(cliCtx, errWrite),
 						RetryAfter:        retryAfter,
 						Options:           selectionOpts,
 						CredentialVersion: auth.CredentialVersion,
@@ -284,7 +299,7 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 					Model:             selectionModel,
 					RouteModel:        routeModel,
 					Success:           false,
-					Error:             &coreauth.Error{Message: errStream.Error(), HTTPStatus: http.StatusBadGateway},
+					Error:             classifyAudioBridgeError(errStream, http.StatusBadGateway),
 					RetryAfter:        retryAfter,
 					Options:           selectionOpts,
 					CredentialVersion: auth.CredentialVersion,
@@ -317,20 +332,21 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 		if homeSelection != nil && resp.StatusCode == http.StatusUnauthorized {
 			h.AuthManager.ReportHomeUnauthorized(cliCtx, auth, auth.Provider, routeModel, respBody)
 		}
+		status := clienterror.HTTPStatusFromErrorOr(errBody, http.StatusBadGateway)
 		h.AuthManager.MarkResult(cliCtx, coreauth.Result{
 			AuthID:            auth.ID,
 			Provider:          auth.Provider,
 			Model:             selectionModel,
 			RouteModel:        routeModel,
 			Success:           false,
-			Error:             &coreauth.Error{Message: errBody.Error(), HTTPStatus: http.StatusBadGateway},
+			Error:             classifyAudioBridgeError(errBody, status),
 			RetryAfter:        retryAfter,
 			Options:           selectionOpts,
 			CredentialVersion: auth.CredentialVersion,
 			RegistrationEpoch: auth.RegistrationEpoch,
 			ExecutionSeq:      executionSeq,
 		})
-		writeSpeechError(c, http.StatusBadGateway, fmt.Sprintf("Failed to read transcription response: %v", errBody))
+		writeSpeechError(c, status, fmt.Sprintf("Failed to read transcription response: %v", errBody))
 		cliCancel(errBody)
 		return
 	}
@@ -382,6 +398,97 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 	c.Status(resp.StatusCode)
 	_, _ = c.Writer.Write(respBody)
 	cliCancel(nil)
+}
+
+func classifyAudioBridgeError(err error, fallbackStatus int) *coreauth.Error {
+	if err == nil {
+		return nil
+	}
+	classified := coreauth.ResultErrorFromError(err)
+	if classified == nil {
+		return &coreauth.Error{Message: err.Error(), HTTPStatus: fallbackStatus}
+	}
+	if classified.HTTPStatus == 0 {
+		classified.HTTPStatus = fallbackStatus
+	}
+	return classified
+}
+
+func classifyAudioBridgeStreamWriteError(ctx context.Context, err error) *coreauth.Error {
+	if err == nil {
+		return nil
+	}
+	if ctx != nil && ctx.Err() != nil {
+		classified := coreauth.ResultErrorFromError(ctx.Err())
+		if classified != nil {
+			if classified.HTTPStatus == 0 {
+				classified.HTTPStatus = clienterror.StatusClientClosedRequest
+			}
+			return classified
+		}
+	}
+	classified := coreauth.ResultErrorFromError(err)
+	if classified == nil {
+		classified = &coreauth.Error{Message: err.Error()}
+	}
+	if classified.Code == "" {
+		classified.Code = coreauth.ErrorCodeConnectionLifecycle
+	}
+	if classified.HTTPStatus == 0 {
+		classified.HTTPStatus = clienterror.StatusClientClosedRequest
+	}
+	return classified
+}
+
+func rewriteAudioMultipartModelField(raw []byte, contentType, targetModel string) ([]byte, string) {
+	targetModel = strings.TrimSpace(targetModel)
+	if targetModel == "" {
+		return raw, contentType
+	}
+	mediaType, params, errParse := mime.ParseMediaType(contentType)
+	if errParse != nil || !strings.EqualFold(mediaType, "multipart/form-data") {
+		return raw, contentType
+	}
+	boundary := strings.TrimSpace(params["boundary"])
+	if boundary == "" {
+		return raw, contentType
+	}
+
+	reader := multipart.NewReader(bytes.NewReader(raw), boundary)
+	var out bytes.Buffer
+	writer := multipart.NewWriter(&out)
+	if errBoundary := writer.SetBoundary(boundary); errBoundary != nil {
+		return raw, contentType
+	}
+	for {
+		part, errPart := reader.NextPart()
+		if errPart == io.EOF {
+			break
+		}
+		if errPart != nil {
+			return raw, contentType
+		}
+		partBytes, errRead := io.ReadAll(part)
+		_ = part.Close()
+		if errRead != nil {
+			return raw, contentType
+		}
+		if part.FileName() == "" && part.FormName() == "model" {
+			partBytes = []byte(targetModel)
+			part.Header.Del("Content-Length")
+		}
+		dst, errCreate := writer.CreatePart(part.Header)
+		if errCreate != nil {
+			return raw, contentType
+		}
+		if _, errWrite := dst.Write(partBytes); errWrite != nil {
+			return raw, contentType
+		}
+	}
+	if errClose := writer.Close(); errClose != nil {
+		return raw, contentType
+	}
+	return out.Bytes(), writer.FormDataContentType()
 }
 
 func isAudioEventStreamContentType(contentType string) bool {
@@ -478,7 +585,7 @@ func (h *OpenAIAPIHandler) selectTranscriptionAuth(ctx context.Context, model, r
 		for _, prov := range providers {
 			selection, errSelect := h.AuthManager.SelectHomeAuth(ctx, prov, selectionModel, opts)
 			if errSelect == nil && selection != nil {
-				return selection, selection.CloneAuth(), selectionModel, nil
+				return selection, selection.CloneAuthForRoute(selectionModel), selectionModel, nil
 			}
 			if errSelect != nil {
 				lastErr = errSelect

@@ -2035,6 +2035,12 @@ func isStreamTruncatedResultError(err *Error) bool {
 	return err != nil && err.Code == streamTruncatedErrorCode
 }
 
+// ResultErrorFromError classifies an execution or transport error into a Result.Error
+// while preserving connection-lifecycle, transient-transport, and request-scoped markers.
+func ResultErrorFromError(err error) *Error {
+	return resultErrorFromError(err)
+}
+
 func resultErrorFromError(err error) *Error {
 	if err == nil {
 		return nil

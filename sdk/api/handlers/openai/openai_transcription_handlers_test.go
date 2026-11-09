@@ -599,3 +599,124 @@ func TestAudioTranscriptionsStreamsEventStreamResponsesIncrementally(t *testing.
 		t.Fatalf("expected done chunk in stream remainder, got %q", string(rest))
 	}
 }
+
+func TestAudioTranscriptionsRewritesUpstreamAliasModelBeforeFinalization(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	exec := &transcriptionCaptureExecutor{provider: "openai-compatibility"}
+	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(exec)
+	manager.SetConfig(&internalconfig.Config{
+		OpenAICompatibility: []internalconfig.OpenAICompatibility{{
+			Name: "groq-compat",
+			Models: []internalconfig.OpenAICompatibilityModel{
+				{Name: "whisper-large-v3", Alias: "whisper-1"},
+			},
+		}},
+		Payload: internalconfig.PayloadConfig{
+			Override: []internalconfig.PayloadRule{
+				{
+					Models: []internalconfig.PayloadModelRule{{Name: "whisper-large-v3"}},
+					Params: map[string]any{"prompt": "upstream alias rule matched"},
+				},
+			},
+		},
+	})
+	auth := &coreauth.Auth{
+		ID:       "compat-alias-auth",
+		Provider: "openai-compatibility",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"api_key":      "test-key",
+			"base_url":     "https://api.example.com/v1",
+			"compat_name":  "groq-compat",
+			"provider_key": "openai-compatibility",
+		},
+	}
+	if _, errReg := manager.Register(context.Background(), auth); errReg != nil {
+		t.Fatalf("manager.Register: %v", errReg)
+	}
+	modelReg := registry.GetGlobalRegistry()
+	modelReg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "whisper-1"}})
+	manager.RefreshSchedulerEntry(auth.ID)
+	t.Cleanup(func() {
+		modelReg.UnregisterClient(auth.ID)
+	})
+
+	base := apihandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	handler := NewOpenAIAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/audio/transcriptions", handler.AudioTranscriptions)
+
+	sampleWAV := []byte("RIFF\x24\x00\x00\x00WAVEfmt ")
+	payload, ct := buildTestAudioMultipart(t, "whisper-1", "audio.wav", sampleWAV)
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+
+	exec.mu.Lock()
+	gotModels := append([]string(nil), exec.models...)
+	gotPrompts := append([]string(nil), exec.prompts...)
+	exec.mu.Unlock()
+	if len(gotModels) != 1 || gotModels[0] != "whisper-large-v3" {
+		t.Fatalf("upstream models = %v, want [whisper-large-v3]", gotModels)
+	}
+	if len(gotPrompts) != 1 || gotPrompts[0] != "upstream alias rule matched" {
+		t.Fatalf("prompts = %v, want [upstream alias rule matched]", gotPrompts)
+	}
+}
+
+func TestAudioTranscriptionsCanceledRequestPreservesLifecycleAndSkipsCooldown(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	exec := &transcriptionCaptureExecutor{
+		provider: "openai-compatibility",
+		customResp: func(_ *coreauth.Auth, _ *http.Request) (*http.Response, error) {
+			return nil, context.Canceled
+		},
+	}
+	manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
+	manager.RegisterExecutor(exec)
+	auth := &coreauth.Auth{
+		ID:       "sole-audio-auth",
+		Provider: "openai-compatibility",
+		Status:   coreauth.StatusActive,
+	}
+	if _, errReg := manager.Register(context.Background(), auth); errReg != nil {
+		t.Fatalf("manager.Register: %v", errReg)
+	}
+	modelReg := registry.GetGlobalRegistry()
+	modelReg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "whisper-1"}})
+	manager.RefreshSchedulerEntry(auth.ID)
+	t.Cleanup(func() {
+		modelReg.UnregisterClient(auth.ID)
+	})
+
+	base := apihandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	handler := NewOpenAIAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/audio/transcriptions", handler.AudioTranscriptions)
+
+	sampleWAV := []byte("RIFF\x24\x00\x00\x00WAVEfmt ")
+	payload, ct := buildTestAudioMultipart(t, "whisper-1", "audio.wav", sampleWAV)
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != 499 {
+		t.Fatalf("status = %d, want 499: %s", rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("auth %s not found", auth.ID)
+	}
+	if updated.Unavailable {
+		t.Fatalf("expected sole credential to remain available after client cancellation, got unavailable=%v", updated.Unavailable)
+	}
+	if state := updated.ModelStates["whisper-1"]; state != nil && (state.Unavailable || !state.NextRetryAfter.IsZero()) {
+		t.Fatalf("expected whisper-1 model state not to cool after client cancellation, got %+v", state)
+	}
+}
