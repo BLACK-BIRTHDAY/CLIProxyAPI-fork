@@ -132,7 +132,16 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 		}()
 	}
 
-	upstreamModel, stateModel := h.AuthManager.ResolveExecutionModelForRequest(cliCtx, auth, selectionModel, homeSelection == nil, reqHeaders)
+	upstreamModel, stateModel, okUpstream := h.AuthManager.ResolveExecutionModelForRequest(cliCtx, auth, selectionModel, homeSelection == nil, reqHeaders)
+	if !okUpstream {
+		if homeSelection != nil {
+			homeSelection.End("no_execution_models")
+		}
+		errUnavailable := &coreauth.Error{Code: "auth_unavailable", Message: "no execution models available", HTTPStatus: http.StatusServiceUnavailable}
+		writeSpeechError(c, http.StatusServiceUnavailable, errUnavailable.Error())
+		cliCancel(errUnavailable)
+		return
+	}
 	baseUpstreamModel := strings.TrimSpace(thinking.ParseSuffix(upstreamModel).ModelName)
 	if baseUpstreamModel == "" {
 		baseUpstreamModel = strings.TrimSpace(upstreamModel)
@@ -191,6 +200,18 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 		httpReq.Header.Set("Content-Type", contentType)
 	}
 
+	ephemeralResult := homeSelection != nil
+	resultProvider := auth.Provider
+	if homeSelection != nil && strings.TrimSpace(homeSelection.Provider) != "" {
+		resultProvider = homeSelection.Provider
+	}
+	recordResult := func(res coreauth.Result) {
+		if res.Provider == "" {
+			res.Provider = resultProvider
+		}
+		h.AuthManager.RecordExecutionResult(cliCtx, res, auth, ephemeralResult)
+	}
+
 	executionSeq := h.AuthManager.NextExecutionSeq()
 	var (
 		resp  *http.Response
@@ -210,9 +231,9 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 			homeSelection.End("request_failed")
 		}
 		status := clienterror.HTTPStatusFromErrorOr(errDo, http.StatusBadGateway)
-		h.AuthManager.MarkResult(cliCtx, coreauth.Result{
+		recordResult(coreauth.Result{
 			AuthID:            auth.ID,
-			Provider:          auth.Provider,
+			Provider:          resultProvider,
 			Model:             selectionModel,
 			RouteModel:        routeModel,
 			Success:           false,
@@ -239,7 +260,7 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 	if homeSelection != nil {
 		if errBind := homeSelection.Bind(closeResponseBody); errBind != nil {
 			if resp.StatusCode == http.StatusUnauthorized {
-				h.AuthManager.ReportHomeUnauthorized(cliCtx, auth, auth.Provider, routeModel)
+				h.AuthManager.ReportHomeUnauthorized(cliCtx, auth, resultProvider, routeModel)
 			}
 			homeSelection.End("response_bind_failed")
 			writeSpeechError(c, http.StatusServiceUnavailable, errBind.Error())
@@ -271,9 +292,9 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 			n, errStream := resp.Body.Read(buf)
 			if n > 0 {
 				if _, errWrite := c.Writer.Write(buf[:n]); errWrite != nil {
-					h.AuthManager.MarkResult(cliCtx, coreauth.Result{
+					recordResult(coreauth.Result{
 						AuthID:            auth.ID,
-						Provider:          auth.Provider,
+						Provider:          resultProvider,
 						Model:             selectionModel,
 						RouteModel:        routeModel,
 						Success:           false,
@@ -293,9 +314,9 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 				break
 			}
 			if errStream != nil {
-				h.AuthManager.MarkResult(cliCtx, coreauth.Result{
+				recordResult(coreauth.Result{
 					AuthID:            auth.ID,
-					Provider:          auth.Provider,
+					Provider:          resultProvider,
 					Model:             selectionModel,
 					RouteModel:        routeModel,
 					Success:           false,
@@ -311,9 +332,9 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 			}
 		}
 
-		h.AuthManager.MarkResult(cliCtx, coreauth.Result{
+		recordResult(coreauth.Result{
 			AuthID:            auth.ID,
-			Provider:          auth.Provider,
+			Provider:          resultProvider,
 			Model:             selectionModel,
 			RouteModel:        routeModel,
 			Success:           true,
@@ -330,12 +351,12 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 	respBody, errBody := io.ReadAll(resp.Body)
 	if errBody != nil {
 		if homeSelection != nil && resp.StatusCode == http.StatusUnauthorized {
-			h.AuthManager.ReportHomeUnauthorized(cliCtx, auth, auth.Provider, routeModel, respBody)
+			h.AuthManager.ReportHomeUnauthorized(cliCtx, auth, resultProvider, routeModel, respBody)
 		}
 		status := clienterror.HTTPStatusFromErrorOr(errBody, http.StatusBadGateway)
-		h.AuthManager.MarkResult(cliCtx, coreauth.Result{
+		recordResult(coreauth.Result{
 			AuthID:            auth.ID,
-			Provider:          auth.Provider,
+			Provider:          resultProvider,
 			Model:             selectionModel,
 			RouteModel:        routeModel,
 			Success:           false,
@@ -353,15 +374,15 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 
 	if resp.StatusCode >= http.StatusBadRequest {
 		if homeSelection != nil && resp.StatusCode == http.StatusUnauthorized {
-			h.AuthManager.ReportHomeUnauthorized(cliCtx, auth, auth.Provider, routeModel, respBody)
+			h.AuthManager.ReportHomeUnauthorized(cliCtx, auth, resultProvider, routeModel, respBody)
 		}
 		errMsg := strings.TrimSpace(string(respBody))
 		if errMsg == "" {
 			errMsg = http.StatusText(resp.StatusCode)
 		}
-		h.AuthManager.MarkResult(cliCtx, coreauth.Result{
+		recordResult(coreauth.Result{
 			AuthID:            auth.ID,
-			Provider:          auth.Provider,
+			Provider:          resultProvider,
 			Model:             selectionModel,
 			RouteModel:        routeModel,
 			Success:           false,
@@ -373,9 +394,9 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 			ExecutionSeq:      executionSeq,
 		})
 	} else {
-		h.AuthManager.MarkResult(cliCtx, coreauth.Result{
+		recordResult(coreauth.Result{
 			AuthID:            auth.ID,
-			Provider:          auth.Provider,
+			Provider:          resultProvider,
 			Model:             selectionModel,
 			RouteModel:        routeModel,
 			Success:           true,
@@ -460,6 +481,7 @@ func rewriteAudioMultipartModelField(raw []byte, contentType, targetModel string
 	if errBoundary := writer.SetBoundary(boundary); errBoundary != nil {
 		return raw, contentType
 	}
+	sawModel := false
 	for {
 		part, errPart := reader.NextPart()
 		if errPart == io.EOF {
@@ -474,6 +496,10 @@ func rewriteAudioMultipartModelField(raw []byte, contentType, targetModel string
 			return raw, contentType
 		}
 		if part.FileName() == "" && part.FormName() == "model" {
+			if sawModel {
+				continue
+			}
+			sawModel = true
 			partBytes = []byte(targetModel)
 			part.Header.Del("Content-Length")
 		}
@@ -686,6 +712,7 @@ func normalizeAudioMultipartRequest(raw []byte, contentType string) ([]byte, str
 		return raw, contentType, "", "", false
 	}
 
+	sawModel := false
 	normalizedModel := ""
 	requestedModel := ""
 	streamRequested := false
@@ -705,12 +732,18 @@ func normalizeAudioMultipartRequest(raw []byte, contentType string) ([]byte, str
 		if part.FileName() == "" {
 			switch part.FormName() {
 			case "model":
+				if sawModel {
+					continue
+				}
+				sawModel = true
 				requestedModel = stripZeroWidthModelChars(string(partBytes))
 				normalizedModel = normalizeAudioTranscriptionModel(string(partBytes))
 				partBytes = []byte(normalizedModel)
 				part.Header.Del("Content-Length")
 			case "stream":
-				streamRequested = isAudioStreamFieldTruthy(string(partBytes))
+				if !streamRequested {
+					streamRequested = isAudioStreamFieldTruthy(string(partBytes))
+				}
 			}
 		}
 		dst, errCreate := writer.CreatePart(part.Header)

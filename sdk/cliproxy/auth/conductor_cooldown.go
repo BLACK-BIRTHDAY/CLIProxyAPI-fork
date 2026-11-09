@@ -1501,6 +1501,13 @@ func (m *Manager) recordExecutionResult(ctx context.Context, result Result, auth
 	m.reportHomeResult(ctx, result, auth)
 }
 
+// RecordExecutionResult records an execution outcome, routing Home dispatches
+// through the ephemeral observation path when ephemeral is true so local auth
+// state is not mutated.
+func (m *Manager) RecordExecutionResult(ctx context.Context, result Result, auth *Auth, ephemeral bool) {
+	m.recordExecutionResult(ctx, result, auth, ephemeral)
+}
+
 // reportHomeResult only observes a Home dispatch result and never updates local auth state.
 func (m *Manager) reportHomeResult(ctx context.Context, result Result, auth *Auth) {
 	if m == nil || result.AuthID == "" {

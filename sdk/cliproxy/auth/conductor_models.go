@@ -205,11 +205,12 @@ func (m *Manager) ResolveExecutionModel(auth *Auth, routeModel string) string {
 
 // ResolveExecutionModelForRequest resolves the credential-aware upstream model
 // and corresponding state attribution model for a selected credential.
-// When localfiltering is true, cooled upstream pool members are skipped first.
-func (m *Manager) ResolveExecutionModelForRequest(ctx context.Context, auth *Auth, routeModel string, localFiltering bool, clientHeaders ...http.Header) (upstreamModel, stateModel string) {
+// When localFiltering is true, cooled upstream pool members are skipped first
+// and ok is false when every candidate for the credential is currently blocked.
+func (m *Manager) ResolveExecutionModelForRequest(ctx context.Context, auth *Auth, routeModel string, localFiltering bool, clientHeaders ...http.Header) (upstreamModel, stateModel string, ok bool) {
 	routeModel = strings.TrimSpace(routeModel)
 	if m == nil {
-		return routeModel, routeModel
+		return routeModel, routeModel, routeModel != ""
 	}
 	var (
 		candidates []string
@@ -217,13 +218,16 @@ func (m *Manager) ResolveExecutionModelForRequest(ctx context.Context, auth *Aut
 	)
 	if localFiltering {
 		candidates, pooled, _, _ = m.preparedExecutionModelsWithAliasForRequest(ctx, auth, routeModel, clientHeaders...)
-	}
-	if len(candidates) == 0 {
+		if len(candidates) == 0 {
+			return "", "", false
+		}
+	} else {
 		candidates, pooled, _, _ = m.executionModelCandidatesWithAlias(auth, routeModel)
+		if len(candidates) == 0 {
+			return "", "", false
+		}
 	}
-	if len(candidates) > 0 {
-		upstreamModel = strings.TrimSpace(candidates[0])
-	}
+	upstreamModel = strings.TrimSpace(candidates[0])
 	if upstreamModel == "" {
 		upstreamModel = routeModel
 	}
@@ -231,7 +235,7 @@ func (m *Manager) ResolveExecutionModelForRequest(ctx context.Context, auth *Aut
 	if strings.TrimSpace(stateModel) == "" {
 		stateModel = routeModel
 	}
-	return upstreamModel, stateModel
+	return upstreamModel, stateModel, true
 }
 
 func (m *Manager) selectionModelForAuth(auth *Auth, routeModel string) string {
