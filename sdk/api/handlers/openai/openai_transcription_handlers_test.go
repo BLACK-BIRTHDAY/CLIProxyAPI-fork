@@ -3,6 +3,7 @@ package openai
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -17,8 +18,14 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	apihandlers "github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executionregistry"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+)
+
+const (
+	testAIStudioTranscriptionProvider = "aistudio2api"
+	testAIStudioTranscribeModel       = "gemini-3.5-transcribe"
 )
 
 type transcriptionCaptureExecutor struct {
@@ -34,13 +41,14 @@ type transcriptionCaptureExecutor struct {
 	reqHeaders  []http.Header
 	failAuthIDs map[string]int
 	respHeaders http.Header
+	customResp  func(auth *coreauth.Auth, req *http.Request) (*http.Response, error)
 }
 
 func (e *transcriptionCaptureExecutor) Identifier() string {
 	if e.provider != "" {
 		return e.provider
 	}
-	return aistudioTranscriptionProvider
+	return testAIStudioTranscriptionProvider
 }
 
 func (e *transcriptionCaptureExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
@@ -94,7 +102,12 @@ func (e *transcriptionCaptureExecutor) HttpRequest(_ context.Context, auth *core
 	for k, vals := range e.respHeaders {
 		respHeaders[k] = append([]string(nil), vals...)
 	}
+	customResp := e.customResp
 	e.mu.Unlock()
+
+	if customResp != nil {
+		return customResp(auth, req)
+	}
 
 	if failStatus >= http.StatusBadRequest {
 		return &http.Response{
@@ -114,13 +127,20 @@ func (e *transcriptionCaptureExecutor) HttpRequest(_ context.Context, auth *core
 	}, nil
 }
 
-func buildTestAudioMultipart(t *testing.T, modelName string, fileName string, audioBytes []byte) ([]byte, string) {
+func buildTestAudioMultipart(t *testing.T, modelName string, fileName string, audioBytes []byte, extraFields ...map[string]string) ([]byte, string) {
 	t.Helper()
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	if modelName != "" {
 		if errField := mw.WriteField("model", modelName); errField != nil {
 			t.Fatalf("WriteField model: %v", errField)
+		}
+	}
+	for _, fields := range extraFields {
+		for k, v := range fields {
+			if errField := mw.WriteField(k, v); errField != nil {
+				t.Fatalf("WriteField %s: %v", k, errField)
+			}
 		}
 	}
 	fw, errCreate := mw.CreateFormFile("file", fileName)
@@ -148,10 +168,20 @@ func TestAudioTranscriptionsAndTranslationsStandardRoutes(t *testing.T) {
 	}
 	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
 	manager.RegisterExecutor(exec)
-	auth := &coreauth.Auth{ID: "aistudio-auth-1", Provider: aistudioTranscriptionProvider, Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{ID: "aistudio-auth-1", Provider: testAIStudioTranscriptionProvider, Status: coreauth.StatusActive}
 	if _, errReg := manager.Register(context.Background(), auth); errReg != nil {
 		t.Fatalf("manager.Register: %v", errReg)
 	}
+	modelReg := registry.GetGlobalRegistry()
+	modelReg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{
+		{ID: testAIStudioTranscribeModel},
+		{ID: "gpt-4o-transcribe"},
+	})
+	manager.RefreshSchedulerEntry(auth.ID)
+	t.Cleanup(func() {
+		modelReg.UnregisterClient(auth.ID)
+	})
+
 	base := apihandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
 	handler := NewOpenAIAPIHandler(base)
 
@@ -167,39 +197,39 @@ func TestAudioTranscriptionsAndTranslationsStandardRoutes(t *testing.T) {
 		wantModel string
 	}{
 		{
-			name:      "standard transcriptions with gemini-3.5-transcribe-live",
+			name:      "standard transcriptions with gemini-3.5-transcribe",
 			path:      "/v1/audio/transcriptions",
-			model:     "gemini-3.5-transcribe-live",
+			model:     testAIStudioTranscribeModel,
 			wantPath:  openAITranscriptionsPath,
-			wantModel: defaultAIStudioTranscribeModel,
+			wantModel: testAIStudioTranscribeModel,
 		},
 		{
-			name:      "zero-width space prefixed gemini-3.5-transcribe-live",
+			name:      "zero-width space prefixed gemini-3.5-transcribe",
 			path:      "/v1/audio/transcriptions",
-			model:     string([]rune{0x200b}) + "gemini-3.5-transcribe-live" + string([]rune{0x200b}),
+			model:     string([]rune{0x200b}) + testAIStudioTranscribeModel + string([]rune{0x200b}),
 			wantPath:  openAITranscriptionsPath,
-			wantModel: defaultAIStudioTranscribeModel,
+			wantModel: testAIStudioTranscribeModel,
 		},
 		{
-			name:      "prefixed AIStudio/gemini-3.5-transcribe-live on /v1/audio/transcriptions",
+			name:      "models/ prefixed gemini-3.5-transcribe on /v1/audio/transcriptions",
 			path:      "/v1/audio/transcriptions",
-			model:     "AIStudio/gemini-3.5-transcribe-live",
+			model:     "models/" + testAIStudioTranscribeModel,
 			wantPath:  openAITranscriptionsPath,
-			wantModel: defaultAIStudioTranscribeModel,
+			wantModel: testAIStudioTranscribeModel,
 		},
 		{
-			name:      "non-alias transcription model preserved",
+			name:      "gpt-4o-transcribe model preserved",
 			path:      "/v1/audio/transcriptions",
 			model:     "gpt-4o-transcribe",
 			wantPath:  openAITranscriptionsPath,
 			wantModel: "gpt-4o-transcribe",
 		},
 		{
-			name:      "audio translations with gemini-3.5-transcribe-live",
+			name:      "audio translations with gemini-3.5-transcribe",
 			path:      "/v1/audio/translations",
-			model:     "gemini-3.5-transcribe-live",
+			model:     testAIStudioTranscribeModel,
 			wantPath:  openAITranslationsPath,
-			wantModel: defaultAIStudioTranscribeModel,
+			wantModel: testAIStudioTranscribeModel,
 		},
 	}
 
@@ -266,11 +296,14 @@ func TestAudioTranscriptionsSchedulerSelectsHealthyAuthAfterCooldown(t *testing.
 		failAuthIDs: map[string]int{
 			"aistudio-auth-bad": http.StatusTooManyRequests,
 		},
+		respHeaders: http.Header{
+			"Retry-After": []string{"120"},
+		},
 	}
 	manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
 	manager.RegisterExecutor(exec)
-	badAuth := &coreauth.Auth{ID: "aistudio-auth-bad", Provider: aistudioTranscriptionProvider, Status: coreauth.StatusActive}
-	goodAuth := &coreauth.Auth{ID: "aistudio-auth-good", Provider: aistudioTranscriptionProvider, Status: coreauth.StatusActive}
+	badAuth := &coreauth.Auth{ID: "aistudio-auth-bad", Provider: testAIStudioTranscriptionProvider, Status: coreauth.StatusActive}
+	goodAuth := &coreauth.Auth{ID: "aistudio-auth-good", Provider: testAIStudioTranscriptionProvider, Status: coreauth.StatusActive}
 	if _, errReg := manager.Register(context.Background(), badAuth); errReg != nil {
 		t.Fatalf("manager.Register badAuth: %v", errReg)
 	}
@@ -278,8 +311,8 @@ func TestAudioTranscriptionsSchedulerSelectsHealthyAuthAfterCooldown(t *testing.
 		t.Fatalf("manager.Register goodAuth: %v", errReg)
 	}
 	modelReg := registry.GetGlobalRegistry()
-	modelReg.RegisterClient(badAuth.ID, badAuth.Provider, []*registry.ModelInfo{{ID: defaultAIStudioTranscribeModel}})
-	modelReg.RegisterClient(goodAuth.ID, goodAuth.Provider, []*registry.ModelInfo{{ID: defaultAIStudioTranscribeModel}})
+	modelReg.RegisterClient(badAuth.ID, badAuth.Provider, []*registry.ModelInfo{{ID: testAIStudioTranscribeModel}})
+	modelReg.RegisterClient(goodAuth.ID, goodAuth.Provider, []*registry.ModelInfo{{ID: testAIStudioTranscribeModel}})
 	manager.RefreshSchedulerEntry(badAuth.ID)
 	manager.RefreshSchedulerEntry(goodAuth.ID)
 	t.Cleanup(func() {
@@ -294,15 +327,24 @@ func TestAudioTranscriptionsSchedulerSelectsHealthyAuthAfterCooldown(t *testing.
 	router.POST("/v1/audio/transcriptions", handler.AudioTranscriptions)
 
 	sampleWAV := []byte("RIFF\x24\x00\x00\x00WAVEfmt ")
-	payload, ct := buildTestAudioMultipart(t, "gemini-3.5-transcribe-live", "audio.wav", sampleWAV)
+	payload, ct := buildTestAudioMultipart(t, testAIStudioTranscribeModel, "audio.wav", sampleWAV)
 
-	// First request hits badAuth, returns 429, and marks it in model-scoped cooldown.
+	// First request hits badAuth, returns 429 with Retry-After: 120, and marks it in model-scoped cooldown.
 	req1 := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(payload))
 	req1.Header.Set("Content-Type", ct)
 	rec1 := httptest.NewRecorder()
 	router.ServeHTTP(rec1, req1)
 	if rec1.Code != http.StatusTooManyRequests {
 		t.Fatalf("first request status = %d, want 429", rec1.Code)
+	}
+
+	updatedBad, ok := manager.GetByID(badAuth.ID)
+	if !ok || updatedBad == nil {
+		t.Fatalf("%s not found", badAuth.ID)
+	}
+	state := updatedBad.ModelStates[testAIStudioTranscribeModel]
+	if state == nil || !state.Unavailable || state.NextRetryAfter.Before(time.Now().Add(90*time.Second)) {
+		t.Fatalf("expected %s model state to be cooled for ~120s from Retry-After, got %+v", testAIStudioTranscribeModel, state)
 	}
 
 	// Second request selects through the scheduler, skipping the cooled-down badAuth and using goodAuth.
@@ -372,90 +414,6 @@ func TestAudioTranscriptionsResolvesBaseURLForHTTPBackedProviders(t *testing.T) 
 	}
 }
 
-func TestAudioTranscriptionsFallbackAuthSelectionRespectsModelCooldownWithCleanSiblingModel(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	exec := &transcriptionCaptureExecutor{
-		failAuthIDs: map[string]int{
-			"aistudio-auth-1": http.StatusTooManyRequests,
-		},
-		respHeaders: http.Header{
-			"Retry-After": []string{"120"},
-		},
-	}
-	manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
-	manager.RegisterExecutor(exec)
-
-	// Register two credentials that also have a clean sibling ModelState
-	// (so auth.Unavailable stays false after gemini-3.5-transcribe cools),
-	// and do NOT register gemini-3.5-transcribe in the global model registry
-	// so selectAIStudioTranscriptionAuth exercises the fallback path.
-	auth1 := &coreauth.Auth{
-		ID:       "aistudio-auth-1",
-		Provider: aistudioTranscriptionProvider,
-		Status:   coreauth.StatusActive,
-		ModelStates: map[string]*coreauth.ModelState{
-			"gemini-2.5-pro": {Status: coreauth.StatusActive},
-		},
-	}
-	auth2 := &coreauth.Auth{
-		ID:       "aistudio-auth-2",
-		Provider: aistudioTranscriptionProvider,
-		Status:   coreauth.StatusActive,
-		ModelStates: map[string]*coreauth.ModelState{
-			"gemini-2.5-pro": {Status: coreauth.StatusActive},
-		},
-	}
-	for _, a := range []*coreauth.Auth{auth1, auth2} {
-		if _, errReg := manager.Register(context.Background(), a); errReg != nil {
-			t.Fatalf("manager.Register(%s): %v", a.ID, errReg)
-		}
-		manager.RefreshSchedulerEntry(a.ID)
-	}
-
-	base := apihandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
-	handler := NewOpenAIAPIHandler(base)
-	router := gin.New()
-	router.POST("/v1/audio/transcriptions", handler.AudioTranscriptions)
-
-	sampleWAV := []byte("RIFF\x24\x00\x00\x00WAVEfmt ")
-	payload, ct := buildTestAudioMultipart(t, "gemini-3.5-transcribe-live", "audio.wav", sampleWAV)
-
-	// First request hits aistudio-auth-1 and receives 429 with Retry-After: 120.
-	req1 := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(payload))
-	req1.Header.Set("Content-Type", ct)
-	rec1 := httptest.NewRecorder()
-	router.ServeHTTP(rec1, req1)
-	if rec1.Code != http.StatusTooManyRequests {
-		t.Fatalf("first request status = %d, want 429: %s", rec1.Code, rec1.Body.String())
-	}
-
-	updatedAuth1, ok := manager.GetByID("aistudio-auth-1")
-	if !ok || updatedAuth1 == nil {
-		t.Fatalf("aistudio-auth-1 not found")
-	}
-	state := updatedAuth1.ModelStates[defaultAIStudioTranscribeModel]
-	if state == nil || !state.Unavailable || state.NextRetryAfter.Before(time.Now().Add(90*time.Second)) {
-		t.Fatalf("expected %s model state to be cooled for ~120s from Retry-After, got %+v", defaultAIStudioTranscribeModel, state)
-	}
-
-	// Second request must skip aistudio-auth-1 (even though its gemini-2.5-pro state is active)
-	// and dispatch to aistudio-auth-2.
-	req2 := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(payload))
-	req2.Header.Set("Content-Type", ct)
-	rec2 := httptest.NewRecorder()
-	router.ServeHTTP(rec2, req2)
-	if rec2.Code != http.StatusOK {
-		t.Fatalf("second request status = %d, want 200: %s", rec2.Code, rec2.Body.String())
-	}
-
-	exec.mu.Lock()
-	gotAuths := append([]string(nil), exec.authIDs...)
-	exec.mu.Unlock()
-	if len(gotAuths) != 2 || gotAuths[0] != "aistudio-auth-1" || gotAuths[1] != "aistudio-auth-2" {
-		t.Fatalf("selected auth sequence = %v, want [aistudio-auth-1 aistudio-auth-2]", gotAuths)
-	}
-}
-
 func TestAudioTranscriptionsAppliesMediaPayloadRules(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	exec := &transcriptionCaptureExecutor{}
@@ -463,19 +421,24 @@ func TestAudioTranscriptionsAppliesMediaPayloadRules(t *testing.T) {
 	manager.RegisterExecutor(exec)
 	auth := &coreauth.Auth{
 		ID:       "aistudio-payload-rule-auth",
-		Provider: aistudioTranscriptionProvider,
+		Provider: testAIStudioTranscriptionProvider,
 		Status:   coreauth.StatusActive,
 	}
 	if _, errReg := manager.Register(context.Background(), auth); errReg != nil {
 		t.Fatalf("manager.Register: %v", errReg)
 	}
+	modelReg := registry.GetGlobalRegistry()
+	modelReg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: testAIStudioTranscribeModel}})
 	manager.RefreshSchedulerEntry(auth.ID)
+	t.Cleanup(func() {
+		modelReg.UnregisterClient(auth.ID)
+	})
 
 	manager.SetConfig(&internalconfig.Config{
 		Payload: internalconfig.PayloadConfig{
 			Override: []internalconfig.PayloadRule{
 				{
-					Models: []internalconfig.PayloadModelRule{{Name: defaultAIStudioTranscribeModel}},
+					Models: []internalconfig.PayloadModelRule{{Name: testAIStudioTranscribeModel}},
 					Params: map[string]any{"prompt": "configured subtitle prompt"},
 				},
 			},
@@ -487,7 +450,7 @@ func TestAudioTranscriptionsAppliesMediaPayloadRules(t *testing.T) {
 	router.POST("/v1/audio/transcriptions", handler.AudioTranscriptions)
 
 	sampleWAV := []byte("RIFF\x24\x00\x00\x00WAVEfmt ")
-	payload, ct := buildTestAudioMultipart(t, "gemini-3.5-transcribe-live", "audio.wav", sampleWAV)
+	payload, ct := buildTestAudioMultipart(t, testAIStudioTranscribeModel, "audio.wav", sampleWAV)
 	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", ct)
 	rec := httptest.NewRecorder()
@@ -501,5 +464,138 @@ func TestAudioTranscriptionsAppliesMediaPayloadRules(t *testing.T) {
 	exec.mu.Unlock()
 	if len(gotPrompts) != 1 || gotPrompts[0] != "configured subtitle prompt" {
 		t.Fatalf("prompts = %v, want [configured subtitle prompt]", gotPrompts)
+	}
+}
+
+type homeAudioFallbackDispatcher struct{}
+
+func (homeAudioFallbackDispatcher) HeartbeatOK() bool { return true }
+
+func (homeAudioFallbackDispatcher) RPopAuth(context.Context, string, string, http.Header, int) ([]byte, error) {
+	return json.Marshal(coreauth.Auth{
+		ID:       "home-custom-compat-auth",
+		Provider: "custom-whisper-provider",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"base_url": "https://home-compat.example.com/v1",
+		},
+	})
+}
+
+func (homeAudioFallbackDispatcher) AbortAmbiguousDispatch() {}
+
+func TestAudioTranscriptionsHomeSelectionUsesRetainedExecutor(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	compatExec := &transcriptionCaptureExecutor{provider: "openai-compatibility"}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
+	manager.PublishHomeDispatch(homeAudioFallbackDispatcher{}, executionregistry.New(), 1)
+	manager.RegisterExecutor(compatExec)
+
+	base := apihandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	handler := NewOpenAIAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/audio/transcriptions", handler.AudioTranscriptions)
+
+	sampleWAV := []byte("RIFF\x24\x00\x00\x00WAVEfmt ")
+	payload, ct := buildTestAudioMultipart(t, "whisper-1", "audio.wav", sampleWAV)
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+
+	compatExec.mu.Lock()
+	gotAuths := append([]string(nil), compatExec.authIDs...)
+	gotURLs := append([]string(nil), compatExec.urls...)
+	compatExec.mu.Unlock()
+	if len(gotAuths) != 1 || gotAuths[0] != "home-custom-compat-auth" {
+		t.Fatalf("authIDs = %v, want [home-custom-compat-auth]", gotAuths)
+	}
+	if len(gotURLs) != 1 || gotURLs[0] != "https://home-compat.example.com/v1/audio/transcriptions" {
+		t.Fatalf("urls = %v, want [https://home-compat.example.com/v1/audio/transcriptions]", gotURLs)
+	}
+}
+
+func TestAudioTranscriptionsStreamsEventStreamResponsesIncrementally(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	firstChunkArrived := make(chan struct{})
+	releaseSecondChunk := make(chan struct{})
+	exec := &transcriptionCaptureExecutor{
+		provider: "openai-compatibility",
+		customResp: func(_ *coreauth.Auth, req *http.Request) (*http.Response, error) {
+			pr, pw := io.Pipe()
+			go func() {
+				defer func() { _ = pw.Close() }()
+				_, _ = pw.Write([]byte("data: {\"type\":\"transcript.text.delta\",\"delta\":\"hello \"}\n\n"))
+				close(firstChunkArrived)
+				<-releaseSecondChunk
+				_, _ = pw.Write([]byte("data: {\"type\":\"transcript.text.done\",\"text\":\"hello world\"}\n\n"))
+			}()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       pr,
+				Request:    req,
+			}, nil
+		},
+	}
+	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(exec)
+	auth := &coreauth.Auth{
+		ID:       "stream-transcribe-auth",
+		Provider: "openai-compatibility",
+		Status:   coreauth.StatusActive,
+	}
+	if _, errReg := manager.Register(context.Background(), auth); errReg != nil {
+		t.Fatalf("manager.Register: %v", errReg)
+	}
+	modelReg := registry.GetGlobalRegistry()
+	modelReg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "gpt-4o-transcribe"}})
+	manager.RefreshSchedulerEntry(auth.ID)
+	t.Cleanup(func() {
+		modelReg.UnregisterClient(auth.ID)
+	})
+
+	base := apihandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	handler := NewOpenAIAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/audio/transcriptions", handler.AudioTranscriptions)
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	sampleWAV := []byte("RIFF\x24\x00\x00\x00WAVEfmt ")
+	payload, ct := buildTestAudioMultipart(t, "gpt-4o-transcribe", "audio.wav", sampleWAV, map[string]string{"stream": "true"})
+	req, errReq := http.NewRequest(http.MethodPost, srv.URL+"/v1/audio/transcriptions", bytes.NewReader(payload))
+	if errReq != nil {
+		t.Fatalf("http.NewRequest: %v", errReq)
+	}
+	req.Header.Set("Content-Type", ct)
+
+	resp, errDo := srv.Client().Do(req)
+	if errDo != nil {
+		t.Fatalf("client.Do: %v", errDo)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	<-firstChunkArrived
+	buf := make([]byte, 256)
+	n, errReadFirst := resp.Body.Read(buf)
+	if errReadFirst != nil {
+		t.Fatalf("first stream read failed before EOF: %v", errReadFirst)
+	}
+	if !strings.Contains(string(buf[:n]), "transcript.text.delta") {
+		t.Fatalf("expected first delta chunk before EOF, got %q", string(buf[:n]))
+	}
+
+	close(releaseSecondChunk)
+	rest, errReadRest := io.ReadAll(resp.Body)
+	if errReadRest != nil {
+		t.Fatalf("read remaining stream: %v", errReadRest)
+	}
+	if !strings.Contains(string(rest), "transcript.text.done") {
+		t.Fatalf("expected done chunk in stream remainder, got %q", string(rest))
 	}
 }

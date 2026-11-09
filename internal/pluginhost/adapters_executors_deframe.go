@@ -51,10 +51,14 @@ func (d *executorSSEDeframer) feed(payload []byte) [][]byte {
 	// carry no data and are dropped so they do not synthesize empty "data: \n\n"
 	// frames downstream.
 	if len(d.buffer) == 0 && !d.sawSSE && !canBeginSSEEvent(payload) {
-		if len(bytes.Trim(payload, "\r\n")) == 0 {
+		trimmed := trimLeadingBlankSSELines(payload)
+		if len(trimmed) == 0 {
 			return nil
 		}
-		return [][]byte{payload}
+		if !canBeginSSEEvent(trimmed) {
+			return [][]byte{payload}
+		}
+		payload = trimmed
 	}
 	d.buffer = append(d.buffer, payload...)
 
@@ -289,6 +293,23 @@ func indexSSEFrameBoundary(b []byte) int {
 func isBlankSSELine(line []byte) bool {
 	line = bytes.TrimSuffix(line, []byte{'\r'})
 	return len(line) == 0
+}
+
+func trimLeadingBlankSSELines(b []byte) []byte {
+	for len(b) > 0 {
+		idx := bytes.IndexByte(b, '\n')
+		if idx < 0 {
+			if isBlankSSELine(b) {
+				return nil
+			}
+			return b
+		}
+		if !isBlankSSELine(b[:idx]) {
+			return b
+		}
+		b = b[idx+1:]
+	}
+	return nil
 }
 
 func isSSECommentOnlyEvent(event []byte) bool {

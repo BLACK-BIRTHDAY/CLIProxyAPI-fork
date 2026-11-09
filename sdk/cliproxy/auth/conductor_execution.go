@@ -2256,6 +2256,36 @@ func (m *Manager) HttpRequest(ctx context.Context, auth *Auth, req *http.Request
 	return exec.HttpRequest(ctx, auth, req)
 }
 
+// ExecuteHomeHttpRequest prepares and executes an HTTP request using the executor retained on a Home dispatch selection.
+func (m *Manager) ExecuteHomeHttpRequest(ctx context.Context, selection *HomeDispatchSelection, req *http.Request) (*Auth, *http.Response, error) {
+	if m == nil {
+		return nil, nil, &Error{Code: "provider_not_found", Message: "manager is nil"}
+	}
+	if selection == nil {
+		return nil, nil, &Error{Code: "auth_not_found", Message: "home selection is nil"}
+	}
+	if req == nil {
+		return nil, nil, &Error{Code: "invalid_request", Message: "http request is nil"}
+	}
+	if selection.Executor == nil {
+		return selection.CloneAuth(), nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
+	}
+	preparedAuth, errPrepare := m.prepareHomeRequestAuth(ctx, selection.Executor, selection)
+	if errPrepare != nil {
+		return selection.CloneAuth(), nil, errPrepare
+	}
+	if preparedAuth == nil {
+		return nil, nil, &Error{Code: "auth_not_found", Message: "auth is nil"}
+	}
+	m.replaceHomeSelectionAuth(selection, preparedAuth)
+	exec := executorForAuth(selection.Executor, preparedAuth)
+	if exec == nil {
+		return preparedAuth, nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
+	}
+	resp, errDo := exec.HttpRequest(ctx, preparedAuth, req)
+	return preparedAuth, resp, errDo
+}
+
 func ensureCanonicalSessionMetadata(metadata map[string]any, headers http.Header, payload []byte) map[string]any {
 	if metadata != nil {
 		if canonicalID, ok := metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey].(string); ok && strings.TrimSpace(canonicalID) != "" {

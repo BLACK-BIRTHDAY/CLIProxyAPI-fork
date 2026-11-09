@@ -19,26 +19,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
-type relaxedModelSupportContextKey struct{}
-
-// WithRelaxedModelSupport returns a context that allows SelectAuth to retain
-// the route model for per-model cooldown and affinity checks without requiring
-// a global model registry entry for the credential.
-func WithRelaxedModelSupport(ctx context.Context) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return context.WithValue(ctx, relaxedModelSupportContextKey{}, true)
-}
-
-func relaxedModelSupportFromContext(ctx context.Context) bool {
-	if ctx == nil {
-		return false
-	}
-	val, _ := ctx.Value(relaxedModelSupportContextKey{}).(bool)
-	return val
-}
-
 func (m *Manager) SetPluginScheduler(scheduler PluginScheduler) {
 	if m == nil {
 		return
@@ -2002,7 +1982,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if !eligibility.allows(candidate) {
 			continue
 		}
-		if modelKey != "" && !relaxedModelSupportFromContext(ctx) && !m.authSupportsRouteModel(registryRef, candidate, model) {
+		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
 		if trackTransientAffinity {
@@ -2394,7 +2374,7 @@ func (m *Manager) HasAlternativeTargetForModel(ctx context.Context, providers []
 		if _, ok := m.executorLocked(providerKey); !ok {
 			continue
 		}
-		if modelKey != "" && !relaxedModelSupportFromContext(ctx) && !m.authSupportsRouteModel(registryRef, candidate, model) {
+		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
 		candidates = append(candidates, candidate)
@@ -2471,7 +2451,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if _, ok := m.executorLocked(providerKey); !ok {
 			continue
 		}
-		if modelKey != "" && !relaxedModelSupportFromContext(ctx) && !m.authSupportsRouteModel(registryRef, candidate, model) {
+		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
 		if trackTransientAffinity {
