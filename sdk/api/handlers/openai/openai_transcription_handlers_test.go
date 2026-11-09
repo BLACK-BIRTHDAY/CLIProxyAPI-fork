@@ -22,6 +22,7 @@ import (
 type transcriptionCaptureExecutor struct {
 	provider    string
 	mu          sync.Mutex
+	urls        []string
 	paths       []string
 	models      []string
 	files       []string
@@ -74,6 +75,7 @@ func (e *transcriptionCaptureExecutor) HttpRequest(_ context.Context, auth *core
 		authID = auth.ID
 	}
 	e.mu.Lock()
+	e.urls = append(e.urls, req.URL.String())
 	e.paths = append(e.paths, req.URL.Path)
 	e.models = append(e.models, model)
 	e.files = append(e.files, hdr.Filename)
@@ -204,6 +206,11 @@ func TestAudioTranscriptionsAndTranslationsStandardRoutes(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, tc.path, bytes.NewReader(payload))
 			req.Header.Set("Content-Type", ct)
 			req.Header.Set("Accept-Encoding", "gzip, zstd")
+			req.Header.Set("X-Api-Key", "cpa-client-secret")
+			req.Header.Set("X-Goog-Api-Key", "cpa-goog-secret")
+			req.Header.Set("Proxy-Authorization", "Basic secret")
+			req.Header.Set("Connection", "X-Hop-Secret")
+			req.Header.Set("X-Hop-Secret", "hop-value")
 			rec := httptest.NewRecorder()
 			router.ServeHTTP(rec, req)
 			if rec.Code != http.StatusOK {
@@ -240,11 +247,10 @@ func TestAudioTranscriptionsAndTranslationsStandardRoutes(t *testing.T) {
 			if !bytes.Equal(gotData, sampleWAV) {
 				t.Fatalf("audio bytes mismatch: %q != %q", gotData, sampleWAV)
 			}
-			if got := gotReqHeader.Get("Content-Encoding"); got != "" {
-				t.Fatalf("forwarded Content-Encoding = %q, want empty", got)
-			}
-			if got := gotReqHeader.Get("Accept-Encoding"); got != "" {
-				t.Fatalf("forwarded Accept-Encoding = %q, want empty", got)
+			for _, forbidden := range []string{"Content-Encoding", "Accept-Encoding", "X-Api-Key", "X-Goog-Api-Key", "Proxy-Authorization", "X-Hop-Secret"} {
+				if got := gotReqHeader.Get(forbidden); got != "" {
+					t.Fatalf("forwarded %s = %q, want empty", forbidden, got)
+				}
 			}
 		})
 	}
@@ -309,5 +315,55 @@ func TestAudioTranscriptionsSchedulerSelectsHealthyAuthAfterCooldown(t *testing.
 	exec.mu.Unlock()
 	if len(gotAuths) != 2 || gotAuths[0] != "aistudio-auth-bad" || gotAuths[1] != "aistudio-auth-good" {
 		t.Fatalf("auth sequence = %v, want [aistudio-auth-bad aistudio-auth-good]", gotAuths)
+	}
+}
+
+func TestAudioTranscriptionsResolvesBaseURLForHTTPBackedProviders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	exec := &transcriptionCaptureExecutor{provider: "openai-compatibility"}
+	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(exec)
+	compatAuth := &coreauth.Auth{
+		ID:       "compat-whisper-auth",
+		Provider: "openai-compatibility",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"base_url": "https://api.example.com/v1",
+		},
+	}
+	if _, errReg := manager.Register(context.Background(), compatAuth); errReg != nil {
+		t.Fatalf("manager.Register: %v", errReg)
+	}
+	modelReg := registry.GetGlobalRegistry()
+	modelReg.RegisterClient(compatAuth.ID, compatAuth.Provider, []*registry.ModelInfo{{ID: "whisper-1"}})
+	manager.RefreshSchedulerEntry(compatAuth.ID)
+	t.Cleanup(func() {
+		modelReg.UnregisterClient(compatAuth.ID)
+	})
+
+	base := apihandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	handler := NewOpenAIAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/audio/transcriptions", handler.AudioTranscriptions)
+
+	sampleWAV := []byte("RIFF\x24\x00\x00\x00WAVEfmt ")
+	payload, ct := buildTestAudioMultipart(t, "whisper-1", "audio.wav", sampleWAV)
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+
+	exec.mu.Lock()
+	gotURLs := append([]string(nil), exec.urls...)
+	gotModels := append([]string(nil), exec.models...)
+	exec.mu.Unlock()
+	if len(gotURLs) != 1 || gotURLs[0] != "https://api.example.com/v1/audio/transcriptions" {
+		t.Fatalf("urls = %v, want [https://api.example.com/v1/audio/transcriptions]", gotURLs)
+	}
+	if len(gotModels) != 1 || gotModels[0] != "whisper-1" {
+		t.Fatalf("models = %v, want [whisper-1]", gotModels)
 	}
 }

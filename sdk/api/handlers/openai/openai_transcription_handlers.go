@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -25,6 +26,24 @@ const (
 	openAITranscriptionsPath       = "/v1/audio/transcriptions"
 	openAITranslationsPath         = "/v1/audio/translations"
 )
+
+var audioBridgeBlockedRequestHeaders = map[string]struct{}{
+	"Accept-Encoding":     {},
+	"Authorization":       {},
+	"Connection":          {},
+	"Content-Encoding":    {},
+	"Content-Length":      {},
+	"Content-Type":        {},
+	"Keep-Alive":          {},
+	"Proxy-Authenticate":  {},
+	"Proxy-Authorization": {},
+	"Te":                  {},
+	"Trailer":             {},
+	"Transfer-Encoding":   {},
+	"Upgrade":             {},
+	"X-Api-Key":           {},
+	"X-Goog-Api-Key":      {},
+}
 
 // AudioTranscriptions handles OpenAI-compatible POST /v1/audio/transcriptions requests.
 func (h *OpenAIAPIHandler) AudioTranscriptions(c *gin.Context) {
@@ -58,32 +77,53 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 		Headers:         reqHeaders,
 		OriginalRequest: raw,
 	}
-	auth, selectionModel, errSelect := h.selectAIStudioTranscriptionAuth(cliCtx, model, requestedModel, selectionOpts)
+	homeSelection, auth, selectionModel, errSelect := h.selectAIStudioTranscriptionAuth(cliCtx, model, requestedModel, selectionOpts)
 	if errSelect != nil {
 		writeSpeechError(c, clienterror.HTTPStatusFromErrorOr(errSelect, http.StatusServiceUnavailable), errSelect.Error())
 		cliCancel(errSelect)
 		return
+	}
+	if auth == nil {
+		if homeSelection != nil {
+			homeSelection.End("missing_auth")
+		}
+		writeSpeechError(c, http.StatusServiceUnavailable, "Audio transcription auth is unavailable")
+		cliCancel(nil)
+		return
+	}
+	if homeSelection != nil {
+		attemptCtx, releaseAttempt, errBind := homeSelection.AttemptContext(cliCtx)
+		if errBind != nil {
+			homeSelection.End("attempt_bind_failed")
+			writeSpeechError(c, http.StatusServiceUnavailable, errBind.Error())
+			cliCancel(errBind)
+			return
+		}
+		cliCtx = attemptCtx
+		defer releaseAttempt()
+		defer func() {
+			if homeSelection.Active() && !homeSelection.Retained() {
+				homeSelection.End("request_closed")
+			}
+		}()
 	}
 	routeModel := requestedModel
 	if routeModel == "" {
 		routeModel = model
 	}
 
-	httpReq, errReq := http.NewRequestWithContext(cliCtx, http.MethodPost, targetPath, bytes.NewReader(body))
+	targetURL := resolveAudioBridgeTargetURL(auth, targetPath)
+	httpReq, errReq := http.NewRequestWithContext(cliCtx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if errReq != nil {
+		if homeSelection != nil {
+			homeSelection.End("invalid_request")
+		}
 		writeSpeechError(c, http.StatusBadRequest, fmt.Sprintf("Invalid request: %v", errReq))
 		cliCancel(errReq)
 		return
 	}
 	if c.Request != nil {
-		for k, vals := range c.Request.Header {
-			if shouldSkipAudioBridgeRequestHeader(k) {
-				continue
-			}
-			for _, v := range vals {
-				httpReq.Header.Add(k, v)
-			}
-		}
+		copyFilteredAudioBridgeRequestHeaders(httpReq.Header, c.Request.Header)
 	}
 	if contentType != "" {
 		httpReq.Header.Set("Content-Type", contentType)
@@ -91,6 +131,9 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 
 	resp, errDo := h.AuthManager.HttpRequest(cliCtx, auth, httpReq)
 	if errDo != nil {
+		if homeSelection != nil {
+			homeSelection.End("request_failed")
+		}
 		status := clienterror.HTTPStatusFromErrorOr(errDo, http.StatusBadGateway)
 		h.AuthManager.MarkResult(cliCtx, coreauth.Result{
 			AuthID:            auth.ID,
@@ -107,14 +150,38 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 		cliCancel(errDo)
 		return
 	}
-	defer func() {
-		if resp != nil && resp.Body != nil {
-			_ = resp.Body.Close()
+	closeResponseBody := func() error {
+		if resp == nil || resp.Body == nil {
+			return nil
 		}
-	}()
+		errClose := resp.Body.Close()
+		if errClose != nil {
+			log.Errorf("openai audio transcription: close response body error: %v", errClose)
+		}
+		return errClose
+	}
+	if homeSelection != nil {
+		if errBind := homeSelection.Bind(closeResponseBody); errBind != nil {
+			if resp.StatusCode == http.StatusUnauthorized {
+				h.AuthManager.ReportHomeUnauthorized(cliCtx, auth, auth.Provider, routeModel)
+			}
+			homeSelection.End("response_bind_failed")
+			writeSpeechError(c, http.StatusServiceUnavailable, errBind.Error())
+			cliCancel(errBind)
+			return
+		}
+		defer homeSelection.End("response_closed")
+	} else {
+		defer func() {
+			_ = closeResponseBody()
+		}()
+	}
 
 	respBody, errBody := io.ReadAll(resp.Body)
 	if errBody != nil {
+		if homeSelection != nil && resp.StatusCode == http.StatusUnauthorized {
+			h.AuthManager.ReportHomeUnauthorized(cliCtx, auth, auth.Provider, routeModel, respBody)
+		}
 		h.AuthManager.MarkResult(cliCtx, coreauth.Result{
 			AuthID:            auth.ID,
 			Provider:          auth.Provider,
@@ -132,6 +199,9 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 	}
 
 	if resp.StatusCode >= http.StatusBadRequest {
+		if homeSelection != nil && resp.StatusCode == http.StatusUnauthorized {
+			h.AuthManager.ReportHomeUnauthorized(cliCtx, auth, auth.Provider, routeModel, respBody)
+		}
 		errMsg := strings.TrimSpace(string(respBody))
 		if errMsg == "" {
 			errMsg = http.StatusText(resp.StatusCode)
@@ -174,18 +244,49 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 	cliCancel(nil)
 }
 
-func shouldSkipAudioBridgeRequestHeader(name string) bool {
-	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "content-type", "content-length", "content-encoding", "accept-encoding", "transfer-encoding", "connection", "authorization":
-		return true
-	default:
-		return false
+func copyFilteredAudioBridgeRequestHeaders(dst, src http.Header) {
+	if dst == nil || src == nil {
+		return
+	}
+	connectionScoped := make(map[string]struct{})
+	for _, rawValue := range src.Values("Connection") {
+		for _, token := range strings.Split(rawValue, ",") {
+			if headerName := strings.TrimSpace(token); headerName != "" {
+				connectionScoped[http.CanonicalHeaderKey(headerName)] = struct{}{}
+			}
+		}
+	}
+	for k, vals := range src {
+		canonicalKey := http.CanonicalHeaderKey(k)
+		if _, blocked := audioBridgeBlockedRequestHeaders[canonicalKey]; blocked {
+			continue
+		}
+		if _, scoped := connectionScoped[canonicalKey]; scoped {
+			continue
+		}
+		for _, v := range vals {
+			dst.Add(k, v)
+		}
 	}
 }
 
-func (h *OpenAIAPIHandler) selectAIStudioTranscriptionAuth(ctx context.Context, model, requestedModel string, opts coreexecutor.Options) (*coreauth.Auth, string, error) {
+func resolveAudioBridgeTargetURL(auth *coreauth.Auth, targetPath string) string {
+	if auth == nil || auth.Attributes == nil {
+		return targetPath
+	}
+	baseURL := strings.TrimRight(strings.TrimSpace(auth.Attributes["base_url"]), "/")
+	if baseURL == "" {
+		return targetPath
+	}
+	if strings.HasSuffix(strings.ToLower(baseURL), "/v1") && strings.HasPrefix(targetPath, "/v1/") {
+		return baseURL + strings.TrimPrefix(targetPath, "/v1")
+	}
+	return baseURL + targetPath
+}
+
+func (h *OpenAIAPIHandler) selectAIStudioTranscriptionAuth(ctx context.Context, model, requestedModel string, opts coreexecutor.Options) (*coreauth.HomeDispatchSelection, *coreauth.Auth, string, error) {
 	if h == nil || h.AuthManager == nil {
-		return nil, "", &coreauth.Error{Code: "provider_not_found", Message: "auth manager is nil", HTTPStatus: http.StatusServiceUnavailable}
+		return nil, nil, "", &coreauth.Error{Code: "provider_not_found", Message: "auth manager is nil", HTTPStatus: http.StatusServiceUnavailable}
 	}
 	lookupModel := model
 	registryProviders := registry.GetGlobalRegistry().GetModelProviders(lookupModel)
@@ -201,20 +302,40 @@ func (h *OpenAIAPIHandler) selectAIStudioTranscriptionAuth(ctx context.Context, 
 		selectionModel = lookupModel
 		providers = registryProviders
 	}
+	if h.AuthManager.HomeEnabled() {
+		homeModel := selectionModel
+		if homeModel == "" {
+			homeModel = lookupModel
+		}
+		var lastErr error
+		for _, prov := range providers {
+			selection, errSelect := h.AuthManager.SelectHomeAuth(ctx, prov, homeModel, opts)
+			if errSelect == nil && selection != nil {
+				return selection, selection.CloneAuth(), homeModel, nil
+			}
+			if errSelect != nil {
+				lastErr = errSelect
+			}
+		}
+		if lastErr != nil {
+			return nil, nil, homeModel, lastErr
+		}
+		return nil, nil, homeModel, &coreauth.Error{Code: "auth_not_found", Message: "no auth available for audio transcription", HTTPStatus: http.StatusServiceUnavailable}
+	}
 	var lastErr error
 	for _, prov := range providers {
 		selected, errSelect := h.AuthManager.SelectAuth(ctx, prov, selectionModel, opts)
 		if errSelect == nil && selected != nil {
-			return selected, selectionModel, nil
+			return nil, selected, selectionModel, nil
 		}
 		if errSelect != nil {
 			lastErr = errSelect
 		}
 	}
 	if lastErr != nil {
-		return nil, selectionModel, lastErr
+		return nil, nil, selectionModel, lastErr
 	}
-	return nil, selectionModel, &coreauth.Error{Code: "auth_not_found", Message: "no auth available for audio transcription", HTTPStatus: http.StatusServiceUnavailable}
+	return nil, nil, selectionModel, &coreauth.Error{Code: "auth_not_found", Message: "no auth available for audio transcription", HTTPStatus: http.StatusServiceUnavailable}
 }
 
 func stripZeroWidthModelChars(s string) string {

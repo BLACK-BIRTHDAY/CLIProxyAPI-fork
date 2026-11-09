@@ -2219,6 +2219,45 @@ func (m *Manager) SelectHomeAuthByKind(ctx context.Context, provider string, mod
 	}
 }
 
+// SelectHomeAuth selects a Home dispatch for a provider while retaining its execution scope.
+func (m *Manager) SelectHomeAuth(ctx context.Context, provider string, model string, opts cliproxyexecutor.Options) (*HomeDispatchSelection, error) {
+	if m == nil || !m.HomeEnabled() {
+		return nil, &Error{Code: "home_unavailable", Message: "home control center unavailable", HTTPStatus: http.StatusServiceUnavailable}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	homeAuthCount := homeAuthCountFromMetadata(opts.Metadata)
+	tried := make(map[string]struct{})
+	for {
+		selectionOpts := withHomeAuthCount(opts, homeAuthCount)
+		selectionOpts = withHomeExcludedAuthIDs(selectionOpts, tried)
+		selection, errSelection := m.pickHomeDispatchSelection(ctx, model, selectionOpts)
+		if errSelection != nil {
+			return nil, errSelection
+		}
+		providerMatches := strings.TrimSpace(provider) == "" || strings.EqualFold(strings.TrimSpace(selection.Provider), strings.TrimSpace(provider))
+		if providerMatches {
+			return selection, nil
+		}
+		authID := ""
+		if selection.Auth != nil {
+			authID = strings.TrimSpace(selection.Auth.ID)
+		}
+		if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "provider_mismatch"); errEnd != nil {
+			return nil, errEnd
+		}
+		if authID == "" {
+			return nil, &Error{Code: "auth_not_found", Message: "selected auth has no ID"}
+		}
+		if _, alreadyTried := tried[authID]; alreadyTried {
+			return nil, &Error{Code: "auth_not_found", Message: "selector repeatedly returned an ineligible auth"}
+		}
+		tried[authID] = struct{}{}
+		homeAuthCount++
+	}
+}
+
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	opts.EnsureMetadata()
 	clearSchedulerSelectionID(opts.Metadata)
