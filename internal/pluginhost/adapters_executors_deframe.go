@@ -36,8 +36,9 @@ import (
 // bare mode, where payloads are forwarded with their chunk boundaries
 // intact and never split or merged.
 type executorSSEDeframer struct {
-	buffer []byte
-	sawSSE bool
+	buffer            []byte
+	pendingBareChunks [][]byte
+	sawSSE            bool
 }
 
 func (d *executorSSEDeframer) feed(payload []byte) [][]byte {
@@ -58,7 +59,10 @@ func (d *executorSSEDeframer) feed(payload []byte) [][]byte {
 		if !canBeginSSEEvent(trimmed) {
 			return [][]byte{payload}
 		}
+		d.pendingBareChunks = [][]byte{bytes.Clone(payload)}
 		payload = trimmed
+	} else if !d.sawSSE && len(d.pendingBareChunks) > 0 {
+		d.pendingBareChunks = append(d.pendingBareChunks, bytes.Clone(payload))
 	}
 	d.buffer = append(d.buffer, payload...)
 
@@ -101,6 +105,12 @@ func (d *executorSSEDeframer) feed(payload []byte) [][]byte {
 				d.advance(idx + 1)
 				continue
 			}
+			if len(d.pendingBareChunks) > 0 {
+				chunks = append(chunks, d.pendingBareChunks...)
+				d.pendingBareChunks = nil
+				d.buffer = nil
+				break
+			}
 			chunks = append(chunks, bytes.Clone(d.buffer))
 			d.buffer = nil
 			break
@@ -110,6 +120,7 @@ func (d *executorSSEDeframer) feed(payload []byte) [][]byte {
 			break
 		}
 		d.sawSSE = true
+		d.pendingBareChunks = nil
 		if len(event) > 0 {
 			chunks = append(chunks, event)
 		}
@@ -117,10 +128,36 @@ func (d *executorSSEDeframer) feed(payload []byte) [][]byte {
 	return chunks
 }
 
+// flushChunks returns any buffered partial event or restored bare chunks at end of stream.
+func (d *executorSSEDeframer) flushChunks() [][]byte {
+	if !d.sawSSE && len(d.pendingBareChunks) > 0 {
+		out := make([][]byte, 0, len(d.pendingBareChunks))
+		for i, c := range d.pendingBareChunks {
+			if i == len(d.pendingBareChunks)-1 {
+				c = bytes.TrimRight(c, "\r\n")
+			}
+			if len(c) > 0 {
+				out = append(out, c)
+			}
+		}
+		d.pendingBareChunks = nil
+		d.buffer = nil
+		return out
+	}
+	if tail := d.flush(); len(tail) > 0 {
+		return [][]byte{tail}
+	}
+	return nil
+}
+
 // flush returns any buffered partial event at end of stream.
 func (d *executorSSEDeframer) flush() []byte {
 	pending := d.buffer
 	d.buffer = nil
+	if !d.sawSSE && len(d.pendingBareChunks) > 0 {
+		pending = bytes.Join(d.pendingBareChunks, nil)
+		d.pendingBareChunks = nil
+	}
 	// Trailing CR/LF bytes are line framing only: the partial content before
 	// them is what remains to be delivered, so a final "data: [DONE]\r" still
 	// reads as the terminal marker. Interior whitespace (including a
@@ -246,16 +283,16 @@ func deframeExecutorSSEChunks(ctx context.Context, in <-chan pluginapi.ExecutorS
 				return
 			case chunk, ok := <-in:
 				if !ok {
-					if tail := deframer.flush(); len(tail) > 0 {
-						_ = emit([][]byte{tail})
+					if tails := deframer.flushChunks(); len(tails) > 0 {
+						_ = emit(tails)
 					}
 					return
 				}
 				if chunk.Err != nil {
 					// Buffered partial events belong to the failed prefix;
 					// emit them before the error is forwarded.
-					if tail := deframer.flush(); len(tail) > 0 {
-						if !emit([][]byte{tail}) {
+					if tails := deframer.flushChunks(); len(tails) > 0 {
+						if !emit(tails) {
 							return
 						}
 					}
