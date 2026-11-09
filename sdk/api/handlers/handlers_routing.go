@@ -166,14 +166,7 @@ func (h *BaseAPIHandler) providersForExecution(modelName, originalRequestedModel
 }
 
 func stripZeroWidthModelRunes(s string) string {
-	return strings.Map(func(r rune) rune {
-		switch r {
-		case 0x200b, 0x200c, 0x200d, 0x200e, 0x200f, 0x2060, 0xfeff, 0x00ad:
-			return -1
-		default:
-			return r
-		}
-	}, s)
+	return thinking.SanitizeModelName(s)
 }
 
 func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowImageModel, allowSpeechModel bool) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {

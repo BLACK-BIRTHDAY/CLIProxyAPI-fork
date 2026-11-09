@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
@@ -101,7 +100,7 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 			coreexecutor.RequestPathMetadataKey:    targetPath,
 		},
 	}
-	homeSelection, auth, selectionModel, errSelect := h.selectTranscriptionAuth(cliCtx, model, requestedModel, selectionOpts)
+	homeSelection, auth, upstreamModel, selectionModel, errSelect := h.selectTranscriptionAuth(cliCtx, model, requestedModel, selectionOpts)
 	if errSelect != nil {
 		writeSpeechError(c, clienterror.HTTPStatusFromErrorOr(errSelect, http.StatusServiceUnavailable), errSelect.Error())
 		cliCancel(errSelect)
@@ -132,25 +131,12 @@ func (h *OpenAIAPIHandler) handleAudioMultipart(c *gin.Context, targetPath strin
 		}()
 	}
 
-	upstreamModel, stateModel, okUpstream := h.AuthManager.ResolveExecutionModelForRequest(cliCtx, auth, selectionModel, homeSelection == nil, reqHeaders)
-	if !okUpstream {
-		if homeSelection != nil {
-			homeSelection.End("no_execution_models")
-		}
-		errUnavailable := &coreauth.Error{Code: "auth_unavailable", Message: "no execution models available", HTTPStatus: http.StatusServiceUnavailable}
-		writeSpeechError(c, http.StatusServiceUnavailable, errUnavailable.Error())
-		cliCancel(errUnavailable)
-		return
-	}
 	baseUpstreamModel := strings.TrimSpace(thinking.ParseSuffix(upstreamModel).ModelName)
 	if baseUpstreamModel == "" {
 		baseUpstreamModel = strings.TrimSpace(upstreamModel)
 	}
 	if baseUpstreamModel == "" {
 		baseUpstreamModel = model
-	}
-	if strings.TrimSpace(stateModel) != "" {
-		selectionModel = stateModel
 	}
 	if baseUpstreamModel != model {
 		body, contentType = rewriteAudioMultipartModelField(body, contentType, baseUpstreamModel)
@@ -574,9 +560,9 @@ func resolveAudioBridgeTargetURL(auth *coreauth.Auth, targetPath string) string 
 	return baseURL + targetPath
 }
 
-func (h *OpenAIAPIHandler) selectTranscriptionAuth(ctx context.Context, model, requestedModel string, opts coreexecutor.Options) (*coreauth.HomeDispatchSelection, *coreauth.Auth, string, error) {
+func (h *OpenAIAPIHandler) selectTranscriptionAuth(ctx context.Context, model, requestedModel string, opts coreexecutor.Options) (*coreauth.HomeDispatchSelection, *coreauth.Auth, string, string, error) {
 	if h == nil || h.AuthManager == nil {
-		return nil, nil, "", &coreauth.Error{Code: "provider_not_found", Message: "auth manager is nil", HTTPStatus: http.StatusServiceUnavailable}
+		return nil, nil, "", "", &coreauth.Error{Code: "provider_not_found", Message: "auth manager is nil", HTTPStatus: http.StatusServiceUnavailable}
 	}
 	lookupModel := strings.TrimSpace(model)
 	if lookupModel == "" {
@@ -603,27 +589,26 @@ func (h *OpenAIAPIHandler) selectTranscriptionAuth(ctx context.Context, model, r
 		selectionModel = requestedModel
 	}
 	if h.AuthManager.HomeEnabled() {
-		providers := registryProviders
-		if len(providers) == 0 {
-			providers = []string{""}
+		selection, errSelect := h.AuthManager.SelectHomeAuth(ctx, "", selectionModel, opts)
+		if errSelect != nil {
+			return nil, nil, "", selectionModel, errSelect
 		}
-		var lastErr error
-		for _, prov := range providers {
-			selection, errSelect := h.AuthManager.SelectHomeAuth(ctx, prov, selectionModel, opts)
-			if errSelect == nil && selection != nil {
-				return selection, selection.CloneAuthForRoute(selectionModel), selectionModel, nil
-			}
-			if errSelect != nil {
-				lastErr = errSelect
-			}
+		if selection == nil {
+			return nil, nil, "", selectionModel, &coreauth.Error{Code: "auth_not_found", Message: "no auth available for audio transcription", HTTPStatus: http.StatusServiceUnavailable}
 		}
-		if lastErr != nil {
-			return nil, nil, selectionModel, lastErr
+		auth := selection.CloneAuthForRoute(selectionModel)
+		upstreamModel, stateModel, okUpstream := h.AuthManager.ResolveExecutionModelForRequest(ctx, auth, selectionModel, false, opts.Headers)
+		if !okUpstream {
+			selection.End("no_execution_models")
+			return nil, nil, "", selectionModel, &coreauth.Error{Code: "auth_unavailable", Message: "no execution models available", HTTPStatus: http.StatusServiceUnavailable}
 		}
-		return nil, nil, selectionModel, &coreauth.Error{Code: "auth_not_found", Message: "no auth available for audio transcription", HTTPStatus: http.StatusServiceUnavailable}
+		if strings.TrimSpace(stateModel) != "" {
+			selectionModel = stateModel
+		}
+		return selection, auth, upstreamModel, selectionModel, nil
 	}
 	if len(registryProviders) == 0 {
-		return nil, nil, selectionModel, &coreauth.Error{
+		return nil, nil, "", selectionModel, &coreauth.Error{
 			Code:       "model_not_found",
 			Message:    "unknown provider for model " + selectionModel,
 			HTTPStatus: http.StatusBadRequest,
@@ -631,18 +616,36 @@ func (h *OpenAIAPIHandler) selectTranscriptionAuth(ctx context.Context, model, r
 	}
 	var lastErr error
 	for _, prov := range registryProviders {
-		selected, errSelect := h.AuthManager.SelectAuth(ctx, prov, selectionModel, opts)
-		if errSelect == nil && selected != nil {
-			return nil, selected, selectionModel, nil
-		}
-		if errSelect != nil {
-			lastErr = errSelect
+		tried := make(map[string]struct{})
+		for {
+			selected, errSelect := h.AuthManager.SelectAuthExcluding(ctx, prov, selectionModel, opts, tried)
+			if errSelect != nil {
+				lastErr = errSelect
+				break
+			}
+			if selected == nil {
+				break
+			}
+			if _, seen := tried[selected.ID]; seen {
+				break
+			}
+			tried[selected.ID] = struct{}{}
+			upstreamModel, stateModel, okUpstream := h.AuthManager.ResolveExecutionModelForRequest(ctx, selected, selectionModel, true, opts.Headers)
+			if !okUpstream {
+				lastErr = &coreauth.Error{Code: "auth_unavailable", Message: "no execution models available", HTTPStatus: http.StatusServiceUnavailable}
+				continue
+			}
+			resolvedSelectionModel := selectionModel
+			if strings.TrimSpace(stateModel) != "" {
+				resolvedSelectionModel = stateModel
+			}
+			return nil, selected, upstreamModel, resolvedSelectionModel, nil
 		}
 	}
 	if lastErr != nil {
-		return nil, nil, selectionModel, lastErr
+		return nil, nil, "", selectionModel, lastErr
 	}
-	return nil, nil, selectionModel, &coreauth.Error{Code: "auth_not_found", Message: "no auth available for audio transcription", HTTPStatus: http.StatusServiceUnavailable}
+	return nil, nil, "", selectionModel, &coreauth.Error{Code: "auth_not_found", Message: "no auth available for audio transcription", HTTPStatus: http.StatusServiceUnavailable}
 }
 
 func parseAudioBridgeRetryAfterHeader(headers http.Header, now time.Time) *time.Duration {
@@ -672,19 +675,7 @@ func parseAudioBridgeRetryAfterHeader(headers http.Header, now time.Time) *time.
 }
 
 func stripZeroWidthModelChars(s string) string {
-	var b strings.Builder
-	b.Grow(len(s))
-	for _, r := range s {
-		switch r {
-		case 0x200b, 0x200c, 0x200d, 0x200e, 0x200f, 0x2060, 0xfeff, 0x00ad:
-			continue
-		}
-		if unicode.IsControl(r) || (!unicode.IsGraphic(r) && !unicode.IsSpace(r)) {
-			continue
-		}
-		b.WriteRune(r)
-	}
-	return strings.TrimSpace(b.String())
+	return thinking.SanitizeModelName(s)
 }
 
 func normalizeAudioTranscriptionModel(model string) string {

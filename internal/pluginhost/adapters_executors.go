@@ -617,14 +617,7 @@ func (a *executorAdapter) prepareExecutorCall(req coreexecutor.Request, opts cor
 }
 
 func stripZeroWidthChars(s string) string {
-	return strings.Map(func(r rune) rune {
-		switch r {
-		case 0x200b, 0x200c, 0x200d, 0x200e, 0x200f, 0x2060, 0xfeff, 0x00ad:
-			return -1
-		default:
-			return r
-		}
-	}, s)
+	return thinking.SanitizeModelName(s)
 }
 
 func (a *executorAdapter) lookupPluginModelInfo(baseModel string) *registry.ModelInfo {

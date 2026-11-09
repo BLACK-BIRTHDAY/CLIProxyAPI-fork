@@ -888,3 +888,118 @@ func TestAudioTranscriptionsCanonicalizesDuplicateModelMultipartFields(t *testin
 		t.Fatalf("models = %v, want [whisper-1]", gotModels)
 	}
 }
+
+func TestAudioTranscriptionsReselectsHealthyAuthWhenFirstAuthAliasPoolIsCooled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	exec := &transcriptionCaptureExecutor{provider: "openai-compatibility"}
+	manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
+	manager.RegisterExecutor(exec)
+	manager.SetConfig(&internalconfig.Config{
+		OpenAICompatibility: []internalconfig.OpenAICompatibility{{
+			Name: "pool-compat",
+			Models: []internalconfig.OpenAICompatibilityModel{
+				{Name: "whisper-pool-a", Alias: "whisper-1"},
+				{Name: "whisper-pool-b", Alias: "whisper-1"},
+			},
+		}},
+	})
+	future := time.Now().Add(5 * time.Minute)
+	cooledAuth := &coreauth.Auth{
+		ID:       "compat-pool-auth-1-cooled",
+		Provider: "openai-compatibility",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"api_key":      "test-key-1",
+			"base_url":     "https://api.example.com/v1",
+			"compat_name":  "pool-compat",
+			"provider_key": "openai-compatibility",
+		},
+		ModelStates: map[string]*coreauth.ModelState{
+			"whisper-pool-a": {Status: coreauth.StatusError, Unavailable: true, NextRetryAfter: future},
+			"whisper-pool-b": {Status: coreauth.StatusError, Unavailable: true, NextRetryAfter: future},
+		},
+	}
+	healthyAuth := &coreauth.Auth{
+		ID:       "compat-pool-auth-2-healthy",
+		Provider: "openai-compatibility",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"api_key":      "test-key-2",
+			"base_url":     "https://api.example.com/v1",
+			"compat_name":  "pool-compat",
+			"provider_key": "openai-compatibility",
+		},
+	}
+	for _, a := range []*coreauth.Auth{cooledAuth, healthyAuth} {
+		if _, errReg := manager.Register(context.Background(), a); errReg != nil {
+			t.Fatalf("manager.Register(%s): %v", a.ID, errReg)
+		}
+		registry.GetGlobalRegistry().RegisterClient(a.ID, a.Provider, []*registry.ModelInfo{{ID: "whisper-1"}})
+		manager.RefreshSchedulerEntry(a.ID)
+	}
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(cooledAuth.ID)
+		registry.GetGlobalRegistry().UnregisterClient(healthyAuth.ID)
+	})
+
+	base := apihandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	handler := NewOpenAIAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/audio/transcriptions", handler.AudioTranscriptions)
+
+	sampleWAV := []byte("RIFF\x24\x00\x00\x00WAVEfmt ")
+	payload, ct := buildTestAudioMultipart(t, "whisper-1⁣", "audio.wav", sampleWAV)
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+
+	exec.mu.Lock()
+	gotAuths := append([]string(nil), exec.authIDs...)
+	exec.mu.Unlock()
+	if len(gotAuths) != 1 || gotAuths[0] != healthyAuth.ID {
+		t.Fatalf("selected auths = %v, want [%s]", gotAuths, healthyAuth.ID)
+	}
+}
+
+func TestAudioTranscriptionsHomeTrustsHomeProviderOverLocalRegistry(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	compatExec := &transcriptionCaptureExecutor{provider: "openai-compatibility"}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
+	manager.PublishHomeDispatch(homeAudioFallbackDispatcher{}, executionregistry.New(), 1)
+	manager.RegisterExecutor(compatExec)
+
+	// Register whisper-1 under a different local provider ("local-only-provider")
+	// while Home dispatches "custom-whisper-provider".
+	modelReg := registry.GetGlobalRegistry()
+	modelReg.RegisterClient("stale-local-client", "local-only-provider", []*registry.ModelInfo{{ID: "whisper-1"}})
+	t.Cleanup(func() {
+		modelReg.UnregisterClient("stale-local-client")
+	})
+
+	base := apihandlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	handler := NewOpenAIAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/audio/transcriptions", handler.AudioTranscriptions)
+
+	sampleWAV := []byte("RIFF\x24\x00\x00\x00WAVEfmt ")
+	payload, ct := buildTestAudioMultipart(t, "whisper-1", "audio.wav", sampleWAV)
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+
+	compatExec.mu.Lock()
+	gotAuths := append([]string(nil), compatExec.authIDs...)
+	compatExec.mu.Unlock()
+	if len(gotAuths) != 1 || gotAuths[0] != "home-custom-compat-auth" {
+		t.Fatalf("authIDs = %v, want [home-custom-compat-auth]", gotAuths)
+	}
+}
